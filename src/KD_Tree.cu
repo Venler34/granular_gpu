@@ -170,6 +170,22 @@ __global__ void findSplitPlane(
     }
 }
 
+__global__ void classifyParticles(
+    const float3 *__restrict__ d_pos,
+    const int *__restrict__ _particle_to_node,
+    int *__restrict__ split_axis, // 0, 1, 2 - 0 for x-axis, 1 for y-axis, 2 for z-axis useful for comparing node[axis] in pos array as well
+    int *__restrict__ split_pos)
+{
+    int idx = blockIdx.idx * blockIdx.dim + threadIdx.x;
+    int node_idx = _particle_to_node[idx];
+
+    int axis = split_axis[idx];
+    int pos = split_pos[idx];
+
+    // assign left or right
+    (d_pos[axis] < pos)
+}
+
 void constructKDTreeHelper()
 {
     // Goes level by level until the tree is complete
@@ -200,7 +216,7 @@ void constructKDTree(const std::shared_ptr<GranularParticles> &particles)
         _list_x.resize(num_particles);
         _list_y.resize(num_particles);
         _list_z.resize(num_particles);
-        _particle_ids.resize(num_particles);
+        _particle_to_node.resize(num_particles); // should contain onlys 0s initially, index -> node
     }
 
     const float3 *d_pos = particles->get_pos_ptr();
@@ -209,6 +225,7 @@ void constructKDTree(const std::shared_ptr<GranularParticles> &particles)
     thrust::sequence(thrust::device, _list_x.addr(), _list_x.addr() + num_particles);
     thrust::sequence(thrust::device, _list_y.addr(), _list_y.addr() + num_particles);
     thrust::sequence(thrust::device, _list_z.addr(), _list_z.addr() + num_particles);
+    thrust::fill(thrust::device, _particle_to_node.addr(), _particle_to_node.addr() + num_particles, 0); // all particles are assigned to node 0 initially
 
     // 2. Sort particle IDs in place along each axis using d_pos, performs merge sort which may be problematic
     thrust::sort(thrust::device, _list_x.addr(), _list_x.addr() + num_particles,

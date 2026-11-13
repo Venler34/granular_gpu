@@ -9,7 +9,7 @@
 class KDTree
 {
 public:
-    KDTree(unsigned int size) : _list_x(size), _list_y(size), _list_z(size),
+    KDTree(unsigned int size) : _list_x(size), _list_y(size), _list_z(size), _particle_to_node(size),
                                 // Node list (initialize to 0 or 2 * size upper bound)
                                 _d_split_axis(0), _d_split_pos(0), _d_left_child(0), _d_right_child(0),
                                 _d_is_leaf(0),
@@ -30,6 +30,8 @@ private:
     DArray<int> _list_x; // store particle ids, but sorted based on respective axis
     DArray<int> _list_y;
     DArray<int> _list_z;
+    DArray<int> _particle_to_node;
+    DArray<int> _offsets; // for parallel stream compactino
 
     // node list
     DArray<int> _d_split_axis;
