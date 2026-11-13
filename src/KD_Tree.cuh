@@ -9,7 +9,9 @@
 class KDTree
 {
 public:
-    KDTree(unsigned int size) : _list_x(size), _list_y(size), _list_z(size), _particle_to_node(size),
+    KDTree(unsigned int size) : num_particles(size), _list_x(size), _list_y(size), 
+                                _list_z(size), _particle_to_node(size), _is_left(size), _left_offset(size),
+                                _temp_x(size), _temp_y(size), _temp_z(size),
                                 // Node list (initialize to 0 or 2 * size upper bound)
                                 _d_split_axis(0), _d_split_pos(0), _d_left_child(0), _d_right_child(0),
                                 _d_is_leaf(0),
@@ -27,11 +29,17 @@ public:
     ~KDTree() = default;
 
 private:
+    unsigned int num_particles;
     DArray<int> _list_x; // store particle ids, but sorted based on respective axis
     DArray<int> _list_y;
     DArray<int> _list_z;
+    DArray<int> _temp_x;
+    DArray<int> _temp_y;
+    DArray<int> _temp_z;
+
     DArray<int> _particle_to_node;
-    DArray<int> _offsets; // for parallel stream compactino
+    DArray<bool> _is_left;
+    DArray<int> _left_offset;
 
     // node list
     DArray<int> _d_split_axis;
@@ -47,7 +55,7 @@ private:
     DArray<int> _d_bbox_max_y;
     DArray<int> _d_bbox_max_z;
 
-    DArray<int> _d_prim_heaad;
+    DArray<int> _d_prim_head;
     DArray<int> _d_prim_count;
 
     // for UPASS and DOWNPASS when constructing preorder version of KD-TREE
