@@ -70,6 +70,12 @@ __device__ bool checkMoreThan10(int bb_max, int bb_min, int dim)
     return diff * 10 >= total;
 }
 
+__device__ bool isLeafNode(int count)
+{
+    return count <= 32;
+}
+
+// for each node determines the split plane
 __global__ void findSplitPlane(
     const float3 *__restrict__ d_pos,
     const int *__restrict__ list_x,
@@ -86,6 +92,7 @@ __global__ void findSplitPlane(
     int *__restrict__ bbox_max_z,
     const int *__restrict__ prim_head,
     const int *__restrict__ prim_count,
+    int *__restrict__ children_generated,
     int num_active_nodes,
     int offset)
 {
@@ -97,6 +104,13 @@ __global__ void findSplitPlane(
     }
     int head = prim_head[node_idx];
     int count = prim_count[node_idx];
+
+    // Threshold for being leaf node
+    if (isLeafNode(count)) {
+        children_generated[idx] = 0;
+        return;
+    }
+    children_generated[idx] = 2;
 
     // Bounding box for primitives
     int minX = d_pos[list_x[head]].x;
@@ -170,6 +184,8 @@ __global__ void findSplitPlane(
     }
 }
 
+
+// determines if each particle goes to left node or right node
 __global__ void classifyParticles(
     const float3 *__restrict__ d_pos,
     const int *__restrict__ _particle_to_node,
@@ -187,6 +203,7 @@ __global__ void classifyParticles(
     is_left[particle_idx] = d_pos[axis] < pos;
 }
 
+// arbitrary function that takes a particle and moves it accordingly depending on if it is less than or greater than threshold
 __device__ void rearrangeList(
     const int* __restrict__ _left_offset, // doesn't rearrange _left_offset[particleID] = number of left particles before this one during split
     const int* __restrict__ _is_left, // doesn't rearrange _is_left[particleID] = if should go to left or right child
@@ -196,7 +213,10 @@ __device__ void rearrangeList(
     // Node List (- indexed by node)
     const int* __restrict__ prim_head, 
     const int* __restricT__ prim_count,
-    int idx
+    int idx,
+    int node_offset,
+    const int active_nodes,
+    const int* __restrict__ child_offset
 ) {
     int particleID = list_dim[idx];
     int nodeID = _particle_to_node[particleID];
@@ -204,15 +224,24 @@ __device__ void rearrangeList(
     {
         int leftIdx = prim_head[nodeID] + _left_offset[particleID];
         temp_dim[leftIdx] = particleID;
+
+        // assign particles to their new node (left child)
+        int newNodeID = node_offset + active_nodes + child_offset[nodeID];
+        _particle_to_node[particleID] = newNodeID;
     } else
     {
         int totalLeft = _left_offset[prim_head[nodeID] + prim_count[nodeID] - 1];
         int rightElementsBefore = idx - prim_head[nodeID] - _left_offset[particleID];
         int rightIdx = prim_head[nodeID] + totalLeft + rightElementsBefore;
         temp_dim[rightIdx] = particleID;
+
+        // assign particles to their new node (right child)
+        int newNodeID = node_offset + active_nodes + child_offset[nodeID] + 1;
+        _particle_to_node[particleID] = newNodeID;
     }
 }
 
+// update listX, listY, listZ
 __global__ void scatterAxisListInPlace(
     // Particle List
     const int* __restrict__ _left_offset, // doesn't rearrange _left_offset[particleID] = number of left particles before this one during split
@@ -226,25 +255,36 @@ __global__ void scatterAxisListInPlace(
     const int* __restrict__ _particle_to_node, // _particle_to_node[particleID] = node
     // Node List (- indexed by node)
     const int* __restrict__ prim_head, 
-    const int* __restricT__ prim_count,
+    const int* __restrict__ prim_count,
+    const int* __restrict__ child_offset, // from _d_child_spawn_count - offset within active node list children
+    const int node_offset, // where the level starts for the parent node
+    const int active_nodes
 )
 {
-    int idx = blockIdx.idx * blockIdx.dim + threadIdx.x;
-    rearrangeList(_left_offset, _is_left, list_x, temp_x, _particle_to_node, prim_head, prim_count, idx);
-    rearrangeList(_left_offset, _is_left, list_y, temp_y, _particle_to_node, prim_head, prim_count, idx);
-    rearrangeList(_left_offset, _is_left, list_z, temp_z, _particle_to_node, prim_head, prim_count, idx);
+    int idx = blockIdx.idx * blockIdx.dim + threadIdx.x; // picks up 3 possibly different particles, may want to rearrange this later on
+    rearrangeList(_left_offset, _is_left, list_x, temp_x, _particle_to_node, prim_head, prim_count, idx, node_offset, active_nodes, child_offset);
+    rearrangeList(_left_offset, _is_left, list_y, temp_y, _particle_to_node, prim_head, prim_count, idx, node_offset, active_nodes, child_offset);
+    rearrangeList(_left_offset, _is_left, list_z, temp_z, _particle_to_node, prim_head, prim_count, idx, node_offset, active_nodes, child_offset);
 }
 
 void constructKDTreeHelper()
 {
     // Goes level by level until the tree is complete
     int num_active_nodes = 1;
-    int offset = 0;
+    int offset = 0; // node offset
+
+    // Active Nodes - based on active nodes we're currently processing
+    // we'll use this to find correct offset
+    DArray<int> _d_child_spawn_count(num_active_nodes);
+
     while (true)
     {
         int gridSize = (num_active_nodes + blockSize - 1) / blockSize;
         int blockSize = 256;
-        findSplitPlane<<<gridSize, blockSize>>>(d_pos, _list_x.addr(), _list_y.addr(), _list_z.addr(), _d_split_axis.addr(), _d_split_pos.addr(), _d_bbox_min_x.addr(), _d_bbox_min_y.addr(), _d_bbox_min_z.addr(), _d_bbox_max_x.addr(), _d_bbox_max_y.addr(), _d_bbox_max_z.addr(), _d_prim_head.addr(), _d_prim_count.addr(), num_active_nodes, offset);
+        findSplitPlane<<<gridSize, blockSize>>>(d_pos, _list_x.addr(), _list_y.addr(), _list_z.addr(), _d_split_axis.addr(), _d_split_pos.addr(), _d_bbox_min_x.addr(), _d_bbox_min_y.addr(), _d_bbox_min_z.addr(), _d_bbox_max_x.addr(), _d_bbox_max_y.addr(), _d_bbox_max_z.addr(), _d_prim_head.addr(), _d_prim_count.addr(), _d_child_spawn_count.addr(), num_active_nodes, offset);
+
+        int childrenProducedLast = _d_child_spawn_count[num_active_nodes-1]; // overwritten at end
+        thrust::exclusive_scan(thrust::device, _d_child_spawn_count.addr(), _d_child_spawn_count.addr() + num_active_nodes, _d_child_spawn_count.addr()); // in place exclusive prefix sum
 
         int particleGridSize = (num_particles - blockSize - 1) / blockSize;
         classifyParticles<<<particleGridSize, blockSize>>>(d_pos, _particle_to_node.addr(), _d_split_axis.addr(), _d_split_pos.addr(), _is_left.addr());
@@ -254,9 +294,16 @@ void constructKDTreeHelper()
 
         // Move particles accordingly so left and right are contiguous in memory
         scatterAxisListInPlace<<<particleGridSize, blockSize>>>(_left_offset.addr(), _is_left.addr(), _list_x.addr(), _list_y.addr(), _list_z.addr(), _temp_x.addr(), _temp_y.addr(), _temp_z.addr(), _particle_to_node.addr(), _d_prim_head.addr(), _d_prim_count.addr());
+        swap(_list_x, _temp_x);
+        swap(_list_y, _temp_y);
+        swap(_list_z, _temp_z);
 
         offset += num_active_nodes;
-        // num_active_nodes = num_children produced in next list
+        num_active_nodes = _d_child_spawn_count[num_active_nodes-1] + childrenProducedLast; // number of children produced
+
+        if (_d_child_spawn_count.capacity() < num_active_nodes) {
+            _d_child_spawn_count.resize(2 * _d_child_spawn_count.capacity());
+        }
     }
 }
 

@@ -258,4 +258,27 @@ public:
     _capacity = new_capacity;
     _length = std::min(_length, new_capacity);
   }
+
+  // Move constructor/assignment to allow for double buffer ping pong strategy
+  DArray(const DArray &&other) noexcept :_addr(other._addr), _length(other._length), _capacity(other._capacity) {
+    other._addr = nullptr;
+    other._length = 0;
+    other._capacity = 0;
+  }
+
+  DArray &operator=(DArray &&other) noexcept {
+    if (this != &other) {
+      if (_addr) {
+        cudaFree(_addr);
+      }
+      _addr = other._addr;
+      _capacity = other._capacity;
+      _length = other._length;
+
+      other._addr = nullptr;
+      other._capacity = 0;
+      other._length = 0;
+    }
+    return *this;
+  }
 };

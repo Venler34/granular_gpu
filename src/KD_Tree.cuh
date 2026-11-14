@@ -44,9 +44,8 @@ private:
     // node list
     DArray<int> _d_split_axis;
     DArray<int> _d_split_pos;
-    DArray<int> _d_left_child;
+    DArray<int> _d_left_child; // index of left/right child of current node 
     DArray<int> _d_right_child;
-    DArray<bool> _d_is_leaf;
 
     DArray<int> _d_bbox_min_x;
     DArray<int> _d_bbox_min_y;
