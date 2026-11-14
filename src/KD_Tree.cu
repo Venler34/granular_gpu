@@ -225,7 +225,7 @@ __device__ void rearrangeList(
         int leftIdx = prim_head[nodeID] + _left_offset[particleID];
         temp_dim[leftIdx] = particleID;
 
-        // assign particles to their new node (left child)
+        // assign particles to their new node (left child) - this is repeated 3 times per particle so may be inefficient
         int newNodeID = node_offset + active_nodes + child_offset[nodeID];
         _particle_to_node[particleID] = newNodeID;
     } else
@@ -277,7 +277,7 @@ void constructKDTreeHelper()
     // we'll use this to find correct offset
     DArray<int> _d_child_spawn_count(num_active_nodes);
 
-    while (true)
+    while (num_active_nodes > 0)
     {
         int gridSize = (num_active_nodes + blockSize - 1) / blockSize;
         int blockSize = 256;
@@ -293,7 +293,7 @@ void constructKDTreeHelper()
         thrust::exclusive_scan_by_key(thrust::device, _particle_to_node.addr(), _particle_to_node.addr() + num_particles, _is_left.addr(), _left_offset.addr());
 
         // Move particles accordingly so left and right are contiguous in memory
-        scatterAxisListInPlace<<<particleGridSize, blockSize>>>(_left_offset.addr(), _is_left.addr(), _list_x.addr(), _list_y.addr(), _list_z.addr(), _temp_x.addr(), _temp_y.addr(), _temp_z.addr(), _particle_to_node.addr(), _d_prim_head.addr(), _d_prim_count.addr());
+        scatterAxisListInPlace<<<particleGridSize, blockSize>>>(_left_offset.addr(), _is_left.addr(), _list_x.addr(), _list_y.addr(), _list_z.addr(), _temp_x.addr(), _temp_y.addr(), _temp_z.addr(), _particle_to_node.addr(), _d_prim_head.addr(), _d_prim_count.addr(), _d_child_spawn_count.addr(), offset, num_active_nodes);
         swap(_list_x, _temp_x);
         swap(_list_y, _temp_y);
         swap(_list_z, _temp_z);
