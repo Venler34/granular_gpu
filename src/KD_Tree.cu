@@ -184,6 +184,20 @@ __global__ void findSplitPlane(
     }
 }
 
+// Called per node generates left / right child indexes
+// Generate the node's bounding boxes for left / right child as well
+// Called after split plane is found
+__global__ void generateLeftAndRightChild(
+    int *__restrict__ left_child, 
+    int *__restrict__ right_child,
+    int *__restrict__  _d_bbox_min_x,
+    int *__restrict__  _d_bbox_min_y,
+    int *__restrict__  _d_bbox_min_z,
+    int *__restrict__  _d_bbox_max_x,
+    int *__restrict__  _d_bbox_max_y,
+    int *__restrict__  _d_bbox_max_z,
+)
+
 
 // determines if each particle goes to left node or right node
 __global__ void classifyParticles(
@@ -273,9 +287,9 @@ void constructKDTreeHelper()
     int num_active_nodes = 1;
     int offset = 0; // node offset
 
-    // Active Nodes - based on active nodes we're currently processing
-    // we'll use this to find correct offset
-    DArray<int> _d_child_spawn_count(num_active_nodes);
+    // size should always be >= num_active_nodes, records number of children produced
+    // we then run prefix sum so we know where the left/right child nodes will be created
+    DArray<int> _d_child_spawn_count(num_active_nodes); 
 
     while (num_active_nodes > 0)
     {
