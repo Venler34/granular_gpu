@@ -13,11 +13,11 @@ public:
                                 _list_z(size), _particle_to_node(size), _is_left(size), _left_offset(size),
                                 _temp_x(size), _temp_y(size), _temp_z(size),
                                 // Node list (initialize to 0 or 2 * size upper bound)
-                                _d_split_axis(0), _d_split_pos(0), _d_left_child(0), _d_right_child(0),
-                                _d_children_spawn_count(0),
-                                _d_bbox_min_x(0), _d_bbox_min_y(0), _d_bbox_min_z(0),
-                                _d_bbox_max_x(0), _d_bbox_max_y(0), _d_bbox_max_z(0),
-                                _d_prim_head(0), _d_prim_count(0),
+                                _d_split_axis(size), _d_split_pos(size), _d_left_child(size), _d_right_child(size),
+                                _d_children_spawn_count(size),
+                                _d_bbox_min_x(size), _d_bbox_min_y(size), _d_bbox_min_z(size),
+                                _d_bbox_max_x(size), _d_bbox_max_y(size), _d_bbox_max_z(size),
+                                _d_prim_head(size), _d_prim_count(size), node_capacity(size),
                                 // UPASS / DOWNPASS
                                 _d_subtree_size(0), _d_preorder_address(0),
                                 _d_start_levels(0), _d_size_levels(0),
@@ -30,6 +30,8 @@ public:
 
 private:
     unsigned int num_particles;
+
+    // Particle List (doesn't change)
     DArray<int> _list_x; // store particle ids, but sorted based on respective axis
     DArray<int> _list_y;
     DArray<int> _list_z;
@@ -41,7 +43,8 @@ private:
     DArray<bool> _is_left;
     DArray<int> _left_offset;
 
-    // node list
+    // Node List (changes based on number of nodes in KD-Tree)
+    unsigned int node_capacity;
     DArray<int> _d_split_axis;
     DArray<int> _d_split_pos;
     DArray<int> _d_left_child; // index of left/right child of current node 

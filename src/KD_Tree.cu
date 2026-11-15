@@ -376,6 +376,26 @@ void constructKDTreeHelper()
         if (_d_children_spawn_prefix.capacity() < num_active_nodes) {
             _d_children_spawn_prefix.resize(2 * _d_children_spawn_prefix.capacity());
         }
+
+        // How much memory do we need to allocate every time we work with the KD-Tree?
+        // For node_list we need at least to have enough space for num_active_nodes
+        // worse case every node generates 2 child nodes
+        if (node_capacity < offset+num_active_nodes) {
+            node_capacity = 2*(offset + num_active_nodes); // try to minimize reallocations if possible
+            _d_split_axis.resize(node_capacity);
+            _d_split_pos.resize(node_capacity);
+            _d_left_child.resize(node_capacity);
+            _d_right_child.resize(node_capacity);
+            _d_children_spawn_count.resize(node_capacity);
+            _d_bbox_min_x.resize(node_capacity);
+            _d_bbox_min_y.resize(node_capacity);
+            _d_bbox_min_z.resize(node_capacity);
+            _d_bbox_max_x.resize(node_capacity);
+            _d_bbox_max_y.resize(node_capacity);
+            _d_bbox_max_z.resize(node_capacity);
+            _d_prim_head.resize(node_capacity);
+            _d_prim_count.resize(node_capacity);
+        }
     }
 }
 
