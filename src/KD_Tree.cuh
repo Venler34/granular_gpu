@@ -1,15 +1,110 @@
-#pragma once
+#ifndef KD_TREE_CUH
+#define KD_TREE_CUH
 
-#include "DArray.hpp"
-#include "helper_math.h"
 #include <cuda_runtime.h>
 #include <vector_types.h>
 #include <memory>
 
+#include "DArray.hpp"
+#include "GranularParticles.h" // Forward-declare class GranularParticles if header name differs
+
+// =========================================================================
+// Device Helper & Kernel Declarations
+// =========================================================================
+
+__device__ bool checkMoreThan10(int bb_max, int bb_min, int dim);
+__device__ bool isLeafNode(int count);
+
+__device__ void copyBoundingBox(
+    int *__restrict__ _d_bbox_min_x,
+    int *__restrict__ _d_bbox_min_y,
+    int *__restrict__ _d_bbox_min_z,
+    int *__restrict__ _d_bbox_max_x,
+    int *__restrict__ _d_bbox_max_y,
+    int *__restrict__ _d_bbox_max_z,
+    int child_node_idx,
+    int parent_node_idx);
+
+__device__ void rearrangeList(
+    const int *__restrict__ _left_offset,
+    const int *__restrict__ _is_left,
+    const int *__restrict__ list_dim,
+    int *__restrict__ temp_dim,
+    int *__restrict__ _particle_to_node,
+    const int *__restrict__ prim_head,
+    const int *__restrict__ prim_count,
+    int idx,
+    const int *__restrict__ _d_left_child,
+    const int *__restrict__ _d_right_child);
+
+__global__ void findSplitPlane(
+    const float3 *__restrict__ d_pos,
+    const int *__restrict__ list_x,
+    const int *__restrict__ list_y,
+    const int *__restrict__ list_z,
+    int *__restrict__ split_axis,
+    int *__restrict__ split_pos,
+    int *__restrict__ bbox_min_x,
+    int *__restrict__ bbox_min_y,
+    int *__restrict__ bbox_min_z,
+    int *__restrict__ bbox_max_x,
+    int *__restrict__ bbox_max_y,
+    int *__restrict__ bbox_max_z,
+    const int *__restrict__ prim_head,
+    const int *__restrict__ prim_count,
+    int *__restrict__ children_generated,
+    int num_active_nodes,
+    int offset);
+
+__global__ void generateLeftAndRightChild(
+    int *__restrict__ left_child,
+    int *__restrict__ right_child,
+    int *__restrict__ split_axis,
+    int *__restrict__ split_pos,
+    int *__restrict__ _d_children_spawn_count,
+    int *__restrict__ _d_bbox_min_x,
+    int *__restrict__ _d_bbox_min_y,
+    int *__restrict__ _d_bbox_min_z,
+    int *__restrict__ _d_bbox_max_x,
+    int *__restrict__ _d_bbox_max_y,
+    int *__restrict__ _d_bbox_max_z,
+    int *__restrict__ _d_children_spawn_prefix,
+    const int active_nodes,
+    const int offset);
+
+__global__ void classifyParticles(
+    const float3 *__restrict__ d_pos,
+    const int *__restrict__ _particle_to_node,
+    int *__restrict__ split_axis,
+    int *__restrict__ split_pos,
+    int *__restrict__ _is_left);
+
+__global__ void scatterAxisListInPlace(
+    const int *__restrict__ _left_offset,
+    const int *__restrict__ _is_left,
+    const int *__restrict__ list_x,
+    const int *__restrict__ list_y,
+    const int *__restrict__ list_z,
+    int *__restrict__ temp_x,
+    int *__restrict__ temp_y,
+    int *__restrict__ temp_z,
+    int *__restrict__ _particle_to_node,
+    const int *__restrict__ prim_head,
+    const int *__restrict__ prim_count,
+    const int node_offset,
+    const int active_nodes,
+    const int *__restrict__ _d_left_child,
+    const int *__restrict__ _d_right_child,
+    const int *__restrict__ _d_children_spawn_count);
+
+// =========================================================================
+// KD-Tree Host Class
+// =========================================================================
+
 class KDTree
 {
 public:
-    KDTree(unsigned int size) : num_particles(size), _list_x(size), _list_y(size), 
+    KDTree(unsigned int size) : num_particles(size), _list_x(size), _list_y(size),
                                 _list_z(size), _particle_to_node(size), _is_left(size), _left_offset(size),
                                 _temp_x(size), _temp_y(size), _temp_z(size),
                                 // Node list (initialize to 0 or 2 * size upper bound)
@@ -26,9 +121,14 @@ public:
                                 _d_out_bbox_minmax(0), _d_out_prim_start(0), _d_out_prim_count(0)
     {
     }
+    KDTree() = default;
     ~KDTree() = default;
 
+    void constructKDTree(const std::shared_ptr<GranularParticles> &particles);
+
 private:
+    void constructKDTreeHelper(const float3 *d_pos, int num_particles);
+
     unsigned int num_particles;
 
     // Particle List (doesn't change)
@@ -47,7 +147,7 @@ private:
     unsigned int node_capacity;
     DArray<int> _d_split_axis;
     DArray<int> _d_split_pos;
-    DArray<int> _d_left_child; // index of left/right child of current node 
+    DArray<int> _d_left_child; // index of left/right child of current node
     DArray<int> _d_right_child;
     DArray<int> _d_children_spawn_count;
 
@@ -77,3 +177,5 @@ private:
     DArray<int> _d_out_prim_start;
     DArray<int> _d_out_prim_count;
 };
+
+#endif // KD_TREE_CUH
