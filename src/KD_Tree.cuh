@@ -14,7 +14,7 @@ public:
                                 _temp_x(size), _temp_y(size), _temp_z(size),
                                 // Node list (initialize to 0 or 2 * size upper bound)
                                 _d_split_axis(0), _d_split_pos(0), _d_left_child(0), _d_right_child(0),
-                                _d_is_leaf(0),
+                                _d_children_spawn_count(0),
                                 _d_bbox_min_x(0), _d_bbox_min_y(0), _d_bbox_min_z(0),
                                 _d_bbox_max_x(0), _d_bbox_max_y(0), _d_bbox_max_z(0),
                                 _d_prim_head(0), _d_prim_count(0),
@@ -46,6 +46,7 @@ private:
     DArray<int> _d_split_pos;
     DArray<int> _d_left_child; // index of left/right child of current node 
     DArray<int> _d_right_child;
+    DArray<int> _d_children_spawn_count;
 
     DArray<int> _d_bbox_min_x;
     DArray<int> _d_bbox_min_y;

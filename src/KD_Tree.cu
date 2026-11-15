@@ -98,7 +98,7 @@ __global__ void findSplitPlane(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x; // node_idx
     int node_idx = offset + idx;
-    if (idx >= num_nodes)
+    if (idx >= num_active_nodes)
     {
         return;
     }
@@ -107,10 +107,10 @@ __global__ void findSplitPlane(
 
     // Threshold for being leaf node
     if (isLeafNode(count)) {
-        children_generated[idx] = 0;
+        children_generated[node_idx] = 0;
         return;
     }
-    children_generated[idx] = 2;
+    children_generated[node_idx] = 2;
 
     // Bounding box for primitives
     int minX = d_pos[list_x[head]].x;
@@ -184,19 +184,68 @@ __global__ void findSplitPlane(
     }
 }
 
-// Called per node generates left / right child indexes
-// Generate the node's bounding boxes for left / right child as well
-// Called after split plane is found
-__global__ void generateLeftAndRightChild(
-    int *__restrict__ left_child, 
-    int *__restrict__ right_child,
+__device__ void copyBoundingBox(
     int *__restrict__  _d_bbox_min_x,
     int *__restrict__  _d_bbox_min_y,
     int *__restrict__  _d_bbox_min_z,
     int *__restrict__  _d_bbox_max_x,
     int *__restrict__  _d_bbox_max_y,
     int *__restrict__  _d_bbox_max_z,
-)
+    int *__restrict__ child_node_idx,
+    int *__restrict__ parent_node_idx
+) {
+    _d_bbox_min_x[child_node_idx] = _d_bbox_min_x[parent_node_idx];
+    _d_bbox_max_x[child_node_idx] = _d_bbox_max_x[parent_node_idx];
+    _d_bbox_min_y[child_node_idx] = _d_bbox_min_y[parent_node_idx];
+    _d_bbox_max_y[child_node_idx] = _d_bbox_max_y[parent_node_idx];
+    _d_bbox_min_z[child_node_idx] = _d_bbox_min_z[parent_node_idx];
+    _d_bbox_max_z[child_node_idx] = _d_bbox_max_z[parent_node_idx];
+}
+
+// Called per node generates left / right child indexes
+// Generate the node's bounding boxes for left / right child as well
+// Called after split plane is found
+__global__ void generateLeftAndRightChild(
+    int *__restrict__ left_child, 
+    int *__restrict__ right_child,
+    int *__restrict__ split_axis, // 0, 1, 2 - 0 for x-axis, 1 for y-axis, 2 for z-axis useful for comparing node[axis] in pos array as well
+    int *__restrict__ split_pos,
+    bool *__restrict__ _d_children_spawn_count,
+    int *__restrict__  _d_bbox_min_x,
+    int *__restrict__  _d_bbox_min_y,
+    int *__restrict__  _d_bbox_min_z,
+    int *__restrict__  _d_bbox_max_x,
+    int *__restrict__  _d_bbox_max_y,
+    int *__restrict__  _d_bbox_max_z,
+    int *__restrict__ _d_children_spawn_prefix, // offset to find children, size is active_nodes
+    const int active_nodes,
+    const int offset
+) {
+    int idx = blockIdx.idx * blockIdx.dim + threadIdx.x;
+    int node_idx = offset + idx;
+    if (idx >= active_nodes) return;
+    if (_d_children_spawn_count[node_idx] == 0) return; // no children produced
+
+    int left_node_idx = offset + _d_children_spawn_prefix[idx];
+    int right_node_idx = left_node+1;
+    
+    left_child[node_idx] = left_node_idx;
+    right_child[node_idx] = right_node_idx;
+
+    copyBoundingBox(_d_bbox_min_x, _d_bbox_min_y, _d_bbox_min_z,  _d_bbox_max_x,  _d_bbox_max_y,  _d_bbox_max_z, left_node_idx, node_idx);
+    copyBoundingBox(_d_bbox_min_x, _d_bbox_min_y, _d_bbox_min_z,  _d_bbox_max_x,  _d_bbox_max_y,  _d_bbox_max_z, right_node_idx, node_idx);
+
+    if (split_axis[node_idx] == 0) {
+        _d_bbox_max_x[left_node_idx] = split_pos[node_idx];
+        _d_bbox_min_x[right_node_idx] = split_pos[node_idx];
+    } else if (split_axis[node_idx] == 1) {
+        _d_bbox_max_y[left_node_idx] = split_pos[node_idx];
+        _d_bbox_min_y[right_node_idx] = split_pos[node_idx];
+    } else {
+        _d_bbox_max_z[left_node_idx] = split_pos[node_idx];
+        _d_bbox_min_z[right_node_idx] = split_pos[node_idx];
+    }
+}
 
 
 // determines if each particle goes to left node or right node
@@ -226,11 +275,10 @@ __device__ void rearrangeList(
     const int* __restrict__ _particle_to_node, // _particle_to_node[particleID] = node
     // Node List (- indexed by node)
     const int* __restrict__ prim_head, 
-    const int* __restricT__ prim_count,
+    const int* __restrict__ prim_count,
     int idx,
-    int node_offset,
-    const int active_nodes,
-    const int* __restrict__ child_offset
+    const int* __restrict__ _d_left_child,
+    const int* __restrict__ _d_right_child,
 ) {
     int particleID = list_dim[idx];
     int nodeID = _particle_to_node[particleID];
@@ -240,8 +288,7 @@ __device__ void rearrangeList(
         temp_dim[leftIdx] = particleID;
 
         // assign particles to their new node (left child) - this is repeated 3 times per particle so may be inefficient
-        int newNodeID = node_offset + active_nodes + child_offset[nodeID];
-        _particle_to_node[particleID] = newNodeID;
+        _particle_to_node[particleID] = _d_left_child[nodeID];
     } else
     {
         int totalLeft = _left_offset[prim_head[nodeID] + prim_count[nodeID] - 1];
@@ -250,8 +297,7 @@ __device__ void rearrangeList(
         temp_dim[rightIdx] = particleID;
 
         // assign particles to their new node (right child)
-        int newNodeID = node_offset + active_nodes + child_offset[nodeID] + 1;
-        _particle_to_node[particleID] = newNodeID;
+        _particle_to_node[particleID] = _d_right_child[nodeID];
     }
 }
 
@@ -270,15 +316,27 @@ __global__ void scatterAxisListInPlace(
     // Node List (- indexed by node)
     const int* __restrict__ prim_head, 
     const int* __restrict__ prim_count,
-    const int* __restrict__ child_offset, // from _d_child_spawn_count - offset within active node list children
     const int node_offset, // where the level starts for the parent node
-    const int active_nodes
+    const int active_nodes,
+
+    const int* __restrict__ _d_left_child,
+    const int* __restrict__ _d_right_child,
+    const int* __restrict__ _d_children_spawn_count
 )
 {
     int idx = blockIdx.idx * blockIdx.dim + threadIdx.x; // picks up 3 possibly different particles, may want to rearrange this later on
-    rearrangeList(_left_offset, _is_left, list_x, temp_x, _particle_to_node, prim_head, prim_count, idx, node_offset, active_nodes, child_offset);
-    rearrangeList(_left_offset, _is_left, list_y, temp_y, _particle_to_node, prim_head, prim_count, idx, node_offset, active_nodes, child_offset);
-    rearrangeList(_left_offset, _is_left, list_z, temp_z, _particle_to_node, prim_head, prim_count, idx, node_offset, active_nodes, child_offset);
+
+    int particleID = list_x[idx];
+    int nodeID = _particle_to_node[particleID];
+
+    if (_d_children_spawn_count[nodeID] == 0) {
+        return; // this doesn't generate any children so we don't rearrange the list
+    }
+
+
+    rearrangeList(_left_offset, _is_left, list_x, temp_x, _particle_to_node, prim_head, prim_count, idx, _d_left_child, _d_right_child);
+    rearrangeList(_left_offset, _is_left, list_y, temp_y, _particle_to_node, prim_head, prim_count, idx, _d_left_child, _d_right_child);
+    rearrangeList(_left_offset, _is_left, list_z, temp_z, _particle_to_node, prim_head, prim_count, idx, _d_left_child, _d_right_child);
 }
 
 void constructKDTreeHelper()
@@ -287,9 +345,7 @@ void constructKDTreeHelper()
     int num_active_nodes = 1;
     int offset = 0; // node offset
 
-    // size should always be >= num_active_nodes, records number of children produced
-    // we then run prefix sum so we know where the left/right child nodes will be created
-    DArray<int> _d_child_spawn_count(num_active_nodes); 
+    DArray<int> _d_children_spawn_prefix(num_active_nodes);
 
     while (num_active_nodes > 0)
     {
@@ -297,9 +353,11 @@ void constructKDTreeHelper()
         int blockSize = 256;
         findSplitPlane<<<gridSize, blockSize>>>(d_pos, _list_x.addr(), _list_y.addr(), _list_z.addr(), _d_split_axis.addr(), _d_split_pos.addr(), _d_bbox_min_x.addr(), _d_bbox_min_y.addr(), _d_bbox_min_z.addr(), _d_bbox_max_x.addr(), _d_bbox_max_y.addr(), _d_bbox_max_z.addr(), _d_prim_head.addr(), _d_prim_count.addr(), _d_child_spawn_count.addr(), num_active_nodes, offset);
 
-        int childrenProducedLast = _d_child_spawn_count[num_active_nodes-1]; // overwritten at end
-        thrust::exclusive_scan(thrust::device, _d_child_spawn_count.addr(), _d_child_spawn_count.addr() + num_active_nodes, _d_child_spawn_count.addr()); // in place exclusive prefix sum
+        int childrenProducedLast = _d_child_spawn_count[offset+num_active_nodes-1]; // overwritten at end
+        thrust::exclusive_scan(thrust::device, _d_child_spawn_count.addr()+offset, _d_child_spawn_count.addr() + offset + num_active_nodes, _d_children_spawn_prefix.addr()); // exclusive prefix sum
 
+        generateLeftAndRightChild<<<gridSize, blockSize>>>(_d_left_child.addr(), _d_right_child.addr(), _d_split_axis.addr(), _d_children_spawn_count.addr(), _d_bbox_min_x.addr(), _d_bbox_min_y.addr(), _d_bbox_min_z.addr(), _d_bbox_max_x.addr(), _d_bbox_max_y.addr(), _d_bbox_max_z.addr(), _d_children_spawn_prefix.addr(), num_active_nodes, offset);
+        
         int particleGridSize = (num_particles - blockSize - 1) / blockSize;
         classifyParticles<<<particleGridSize, blockSize>>>(d_pos, _particle_to_node.addr(), _d_split_axis.addr(), _d_split_pos.addr(), _is_left.addr());
 
@@ -307,7 +365,7 @@ void constructKDTreeHelper()
         thrust::exclusive_scan_by_key(thrust::device, _particle_to_node.addr(), _particle_to_node.addr() + num_particles, _is_left.addr(), _left_offset.addr());
 
         // Move particles accordingly so left and right are contiguous in memory
-        scatterAxisListInPlace<<<particleGridSize, blockSize>>>(_left_offset.addr(), _is_left.addr(), _list_x.addr(), _list_y.addr(), _list_z.addr(), _temp_x.addr(), _temp_y.addr(), _temp_z.addr(), _particle_to_node.addr(), _d_prim_head.addr(), _d_prim_count.addr(), _d_child_spawn_count.addr(), offset, num_active_nodes);
+        scatterAxisListInPlace<<<particleGridSize, blockSize>>>(_left_offset.addr(), _is_left.addr(), _list_x.addr(), _list_y.addr(), _list_z.addr(), _temp_x.addr(), _temp_y.addr(), _temp_z.addr(), _particle_to_node.addr(), _d_prim_head.addr(), _d_prim_count.addr(), offset, num_active_nodes, _d_left_child.addr(), _d_right_child.addr(), _d_child_spawn_count.addr());
         swap(_list_x, _temp_x);
         swap(_list_y, _temp_y);
         swap(_list_z, _temp_z);
@@ -315,8 +373,8 @@ void constructKDTreeHelper()
         offset += num_active_nodes;
         num_active_nodes = _d_child_spawn_count[num_active_nodes-1] + childrenProducedLast; // number of children produced
 
-        if (_d_child_spawn_count.capacity() < num_active_nodes) {
-            _d_child_spawn_count.resize(2 * _d_child_spawn_count.capacity());
+        if (_d_children_spawn_prefix.capacity() < num_active_nodes) {
+            _d_children_spawn_prefix.resize(2 * _d_children_spawn_prefix.capacity());
         }
     }
 }
