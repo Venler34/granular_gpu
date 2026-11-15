@@ -12,16 +12,16 @@
 // Device Helper & Kernel Declarations
 // =========================================================================
 
-__device__ bool checkMoreThan10(int bb_max, int bb_min, int dim);
+__device__ bool checkMoreThan10(float bb_max, float bb_min, float dim);
 __device__ bool isLeafNode(int count);
 
 __device__ void copyBoundingBox(
-    int *__restrict__ _d_bbox_min_x,
-    int *__restrict__ _d_bbox_min_y,
-    int *__restrict__ _d_bbox_min_z,
-    int *__restrict__ _d_bbox_max_x,
-    int *__restrict__ _d_bbox_max_y,
-    int *__restrict__ _d_bbox_max_z,
+    float *__restrict__ _d_bbox_min_x,
+    float *__restrict__ _d_bbox_min_y,
+    float *__restrict__ _d_bbox_min_z,
+    float *__restrict__ _d_bbox_max_x,
+    float *__restrict__ _d_bbox_max_y,
+    float *__restrict__ _d_bbox_max_z,
     int child_node_idx,
     int parent_node_idx);
 
@@ -43,13 +43,13 @@ __global__ void findSplitPlane(
     const int *__restrict__ list_y,
     const int *__restrict__ list_z,
     int *__restrict__ split_axis,
-    int *__restrict__ split_pos,
-    int *__restrict__ bbox_min_x,
-    int *__restrict__ bbox_min_y,
-    int *__restrict__ bbox_min_z,
-    int *__restrict__ bbox_max_x,
-    int *__restrict__ bbox_max_y,
-    int *__restrict__ bbox_max_z,
+    float *__restrict__ split_pos,
+    float *__restrict__ bbox_min_x,
+    float *__restrict__ bbox_min_y,
+    float *__restrict__ bbox_min_z,
+    float *__restrict__ bbox_max_x,
+    float *__restrict__ bbox_max_y,
+    float *__restrict__ bbox_max_z,
     const int *__restrict__ prim_head,
     const int *__restrict__ prim_count,
     int *__restrict__ children_generated,
@@ -60,14 +60,14 @@ __global__ void generateLeftAndRightChild(
     int *__restrict__ left_child,
     int *__restrict__ right_child,
     int *__restrict__ split_axis,
-    int *__restrict__ split_pos,
+    float *__restrict__ split_pos,
     int *__restrict__ _d_children_spawn_count,
-    int *__restrict__ _d_bbox_min_x,
-    int *__restrict__ _d_bbox_min_y,
-    int *__restrict__ _d_bbox_min_z,
-    int *__restrict__ _d_bbox_max_x,
-    int *__restrict__ _d_bbox_max_y,
-    int *__restrict__ _d_bbox_max_z,
+    float *__restrict__ _d_bbox_min_x,
+    float *__restrict__ _d_bbox_min_y,
+    float *__restrict__ _d_bbox_min_z,
+    float *__restrict__ _d_bbox_max_x,
+    float *__restrict__ _d_bbox_max_y,
+    float *__restrict__ _d_bbox_max_z,
     int *__restrict__ _d_children_spawn_prefix,
     const int active_nodes,
     const int offset);
@@ -76,7 +76,7 @@ __global__ void classifyParticles(
     const float3 *__restrict__ d_pos,
     const int *__restrict__ _particle_to_node,
     int *__restrict__ split_axis,
-    int *__restrict__ split_pos,
+    float *__restrict__ split_pos,
     int *__restrict__ _is_left);
 
 __global__ void scatterAxisListInPlace(
@@ -140,23 +140,23 @@ private:
     DArray<int> _temp_z;
 
     DArray<int> _particle_to_node;
-    DArray<bool> _is_left;
+    DArray<int> _is_left;
     DArray<int> _left_offset;
 
     // Node List (changes based on number of nodes in KD-Tree)
     unsigned int node_capacity;
     DArray<int> _d_split_axis;
-    DArray<int> _d_split_pos;
+    DArray<float> _d_split_pos;
     DArray<int> _d_left_child; // index of left/right child of current node
     DArray<int> _d_right_child;
     DArray<int> _d_children_spawn_count;
 
-    DArray<int> _d_bbox_min_x;
-    DArray<int> _d_bbox_min_y;
-    DArray<int> _d_bbox_min_z;
-    DArray<int> _d_bbox_max_x;
-    DArray<int> _d_bbox_max_y;
-    DArray<int> _d_bbox_max_z;
+    DArray<float> _d_bbox_min_x;
+    DArray<float> _d_bbox_min_y;
+    DArray<float> _d_bbox_min_z;
+    DArray<float> _d_bbox_max_x;
+    DArray<float> _d_bbox_max_y;
+    DArray<float> _d_bbox_max_z;
 
     DArray<int> _d_prim_head;
     DArray<int> _d_prim_count;
