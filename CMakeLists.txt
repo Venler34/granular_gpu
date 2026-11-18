@@ -51,6 +51,7 @@ add_executable(granular_gpu
   src/Export.cu
   src/GranularSystem.cu
   src/Solver.cu
+  src/KD_Tree.cu
   src/SceneConfig.cpp
   src/ShaderUtility.cpp
 )
@@ -58,6 +59,13 @@ add_executable(granular_gpu
 # Lets the program find scenes/, obj/ and shaders from any working directory.
 target_compile_definitions(granular_gpu PRIVATE
   GRANULAR_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+
+# Debugging aid: synchronize after every KD-tree kernel launch so errors are reported at the kernel that caused them.
+# Enable with -DKD_TREE_DEBUG_SYNC=ON, slows the build down so keep it off otherwise.
+option(KD_TREE_DEBUG_SYNC "Synchronize after every KD-tree kernel launch" OFF)
+if(KD_TREE_DEBUG_SYNC)
+  target_compile_definitions(granular_gpu PRIVATE KD_TREE_DEBUG_SYNC)
+endif()
 
 target_compile_options(granular_gpu PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -Xcompiler=-Wall>)

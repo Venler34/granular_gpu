@@ -259,8 +259,28 @@ public:
     _length = std::min(_length, new_capacity);
   }
 
+  // Like resize, but copies the whole old allocation instead of only _length elements.
+  // For arrays filled by kernels through addr(), which never update _length (e.g. KD-tree node arrays).
+  void resizeKeepAll(unsigned int new_capacity) {
+    T *new_addr;
+    CUDA_CALL(cudaMalloc(&new_addr, sizeof(T) * new_capacity));
+
+    thrust::device_ptr<T> dst_ptr(new_addr);
+    thrust::device_ptr<T> src_ptr(_addr);
+
+    if (_capacity > 0) {
+      thrust::copy(thrust::device, src_ptr,
+                   src_ptr + std::min(_capacity, new_capacity), dst_ptr);
+    }
+
+    cudaFree(_addr);
+    _addr = new_addr;
+    _capacity = new_capacity;
+    _length = std::min(_length, new_capacity);
+  }
+
   // Move constructor/assignment to allow for double buffer ping pong strategy
-  DArray(const DArray &&other) noexcept :_addr(other._addr), _length(other._length), _capacity(other._capacity) {
+  DArray(DArray &&other) noexcept :_addr(other._addr), _length(other._length), _capacity(other._capacity) {
     other._addr = nullptr;
     other._length = 0;
     other._capacity = 0;
