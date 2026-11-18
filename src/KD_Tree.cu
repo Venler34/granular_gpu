@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint> // uint32_t, uint64_t for Morton codes or node bitmasks
 #include <cstdio>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -489,6 +490,85 @@ __global__ void updateParticleToNode(
     _particle_to_node[particle_idx] = _is_left[particle_idx] ? _d_left_child[node_idx] : _d_right_child[node_idx];
 }
 
+// Preorder UPPASS for one level, called per node of the level
+// subtree_size[node] = number of KDNode slots the subtree of node takes in the preorder tree
+// A leaf is a single KDNode (it only points into the particle list), so its size is 1
+// Children are always in the level below, so the levels have to be processed from the bottom up
+__global__ void upPassLevel(
+    const int *__restrict__ left_child,
+    const int *__restrict__ right_child,
+    int *__restrict__ subtree_size,
+    const int level_start,
+    const int level_nodes)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= level_nodes)
+        return;
+    int node_idx = level_start + idx;
+
+    if (left_child[node_idx] == -1)
+    {
+        subtree_size[node_idx] = 1; // leaf
+    }
+    else
+    {
+        subtree_size[node_idx] = subtree_size[left_child[node_idx]] + subtree_size[right_child[node_idx]] + 1;
+    }
+}
+
+// Preorder DOWNPASS for one level, called per node of the level
+// The parent sets the final address of its children, the children read it when their level is processed
+// Left child goes right after the node, right child goes after the whole left subtree
+// The node itself is written as a KDNode to its own address
+// Levels have to be processed from the top down, and the root's address has to be set to 0 beforehand
+__global__ void downPassLevel(
+    const int *__restrict__ left_child,
+    const int *__restrict__ right_child,
+    const int *__restrict__ split_axis,
+    const float *__restrict__ split_pos,
+    const float *__restrict__ bbox_min_x,
+    const float *__restrict__ bbox_min_y,
+    const float *__restrict__ bbox_min_z,
+    const float *__restrict__ bbox_max_x,
+    const float *__restrict__ bbox_max_y,
+    const float *__restrict__ bbox_max_z,
+    const int *__restrict__ prim_head,
+    const int *__restrict__ prim_count,
+    const int *__restrict__ subtree_size,
+    int *__restrict__ preorder_address,
+    KDNode *__restrict__ out_nodes,
+    const int level_start,
+    const int level_nodes)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= level_nodes)
+        return;
+    int node_idx = level_start + idx;
+    int address = preorder_address[node_idx];
+
+    KDNode node;
+    node.bb_min = make_float3(bbox_min_x[node_idx], bbox_min_y[node_idx], bbox_min_z[node_idx]);
+    node.bb_max = make_float3(bbox_max_x[node_idx], bbox_max_y[node_idx], bbox_max_z[node_idx]);
+
+    if (left_child[node_idx] == -1)
+    {
+        node.setLeaf(prim_head[node_idx], prim_count[node_idx]);
+    }
+    else
+    {
+        int left_node_idx = left_child[node_idx];
+        int right_node_idx = right_child[node_idx];
+
+        int right_address = address + 1 + subtree_size[left_node_idx];
+        preorder_address[left_node_idx] = address + 1;
+        preorder_address[right_node_idx] = right_address;
+
+        node.setInternal(split_axis[node_idx], split_pos[node_idx], right_address);
+    }
+
+    out_nodes[address] = node;
+}
+
 // Computes _left_offset for one dimension list, then rearranges that list
 void KDTree::scanAndScatter(DArray<int> &list_dim, DArray<int> &temp_dim)
 {
@@ -518,15 +598,15 @@ void KDTree::constructKDTreeHelper(const float3 *d_pos, int num_particles)
     int depth = 0;  // tree level of the active nodes
 
     // start offset and number of nodes of every level, needed later for the preorder UPPASS / DOWNPASS
-    std::vector<int> level_start;
-    std::vector<int> level_size;
+    _level_start.clear();
+    _level_size.clear();
 
     DArray<int> _d_children_spawn_prefix(num_active_nodes);
 
     while (num_active_nodes > 0)
     {
-        level_start.push_back(offset);
-        level_size.push_back(num_active_nodes);
+        _level_start.push_back(offset);
+        _level_size.push_back(num_active_nodes);
 
         const bool force_leaf = depth >= MAX_TREE_DEPTH;
         int blockSize = 256;
@@ -598,16 +678,7 @@ void KDTree::constructKDTreeHelper(const float3 *d_pos, int num_particles)
 
     // offset is now the total number of nodes in the tree
     _num_nodes = offset;
-    _num_levels = level_start.size();
-
-    // Upload the level info
-    if (_d_start_levels.capacity() < _num_levels)
-    {
-        _d_start_levels.resize(_num_levels);
-        _d_size_levels.resize(_num_levels);
-    }
-    CUDA_CALL(cudaMemcpy(_d_start_levels.addr(), level_start.data(), sizeof(int) * _num_levels, cudaMemcpyHostToDevice));
-    CUDA_CALL(cudaMemcpy(_d_size_levels.addr(), level_size.data(), sizeof(int) * _num_levels, cudaMemcpyHostToDevice));
+    _num_levels = _level_start.size();
 
     // One entry per node for the preorder passes, contents are rewritten by those passes so nothing needs to be preserved
     if (_d_subtree_size.capacity() < _num_nodes)
@@ -615,6 +686,60 @@ void KDTree::constructKDTreeHelper(const float3 *d_pos, int num_particles)
         _d_subtree_size.resize(_num_nodes);
         _d_preorder_address.resize(_num_nodes);
     }
+}
+
+// Runs the UPPASS over all levels, bottom-up. Launches on the same stream run in order, so no sync is needed between levels
+void KDTree::upPass()
+{
+    const int blockSize = 256;
+    for (int level = (int)_num_levels - 1; level >= 0; level--)
+    {
+        int level_nodes = _level_size[level];
+        int gridSize = (level_nodes + blockSize - 1) / blockSize;
+        upPassLevel<<<gridSize, blockSize>>>(_d_left_child.addr(), _d_right_child.addr(), _d_subtree_size.addr(), _level_start[level], level_nodes);
+        KD_CHECK_KERNEL();
+    }
+
+    // every leaf has size 1, so the root's subtree has to contain every node
+    int root_size = readDeviceInt(_d_subtree_size.addr(), 0);
+    if (root_size != (int)_num_nodes)
+    {
+        printf("[KDTree upPass] root subtree size %d does not match the node count %u\n", root_size, _num_nodes);
+    }
+}
+
+// Runs the DOWNPASS over all levels, top-down. Needs the subtree sizes from upPass()
+void KDTree::downPass()
+{
+    // leaves are a single KDNode, so the preorder tree has exactly one entry per node
+    if (_d_out_nodes.capacity() < _num_nodes)
+    {
+        _d_out_nodes.resize(_num_nodes); // rewritten completely below, nothing needs to be preserved
+    }
+
+    // the root goes to address 0
+    CUDA_CALL(cudaMemset(_d_preorder_address.addr(), 0, sizeof(int)));
+
+    const int blockSize = 256;
+    for (int level = 0; level < (int)_num_levels; level++)
+    {
+        int level_nodes = _level_size[level];
+        int gridSize = (level_nodes + blockSize - 1) / blockSize;
+        downPassLevel<<<gridSize, blockSize>>>(_d_left_child.addr(), _d_right_child.addr(), _d_split_axis.addr(), _d_split_pos.addr(),
+                                               _d_bbox_min_x.addr(), _d_bbox_min_y.addr(), _d_bbox_min_z.addr(),
+                                               _d_bbox_max_x.addr(), _d_bbox_max_y.addr(), _d_bbox_max_z.addr(),
+                                               _d_prim_head.addr(), _d_prim_count.addr(), _d_subtree_size.addr(),
+                                               _d_preorder_address.addr(), _d_out_nodes.addr(), _level_start[level], level_nodes);
+        KD_CHECK_KERNEL();
+    }
+}
+
+// Organizes the finished tree in preorder (node, left subtree, right subtree) into _d_out_nodes
+// UPPASS computes the subtree sizes bottom-up, DOWNPASS uses them to assign the addresses top-down and writes the nodes
+void KDTree::buildPreorderTree()
+{
+    upPass();
+    downPass();
 }
 
 // particles is stored in device memory
@@ -666,13 +791,17 @@ void KDTree::constructKDTree(const std::shared_ptr<GranularParticles> &particles
 
     // Now you have to run algorithm - split the work up into kernel, kernel should be working on active list
     constructKDTreeHelper(d_pos, num_particles);
+
+    // Reorganize the finished tree in preorder
+    buildPreorderTree();
 }
 
 // =====================================================================================================
 // TEMPORARY: debug validation of the finished tree. It copies everything to the host and checks the tree
-// with plain loops, so it is slow and only meant for development. Call validateKDTree(d_pos) right after
-// constructKDTree while checking the construction. Once the construction is trusted, remove this whole
-// section, the declaration of validateKDTree in KD_Tree.cuh, and every call to it.
+// with plain loops, so it is slow and only meant for development. Call validateKDTree(d_pos) (BFS tree built
+// by the construction) and validatePreorderTree(d_pos) (preorder tree in _d_out_nodes) right after
+// constructKDTree while checking it. Once the tree is trusted, remove this whole section, the declarations
+// of validateKDTree and validatePreorderTree in KD_Tree.cuh, and every call to them.
 // =====================================================================================================
 template <typename T>
 static std::vector<T> copyToHost(const T *d_ptr, size_t count)
@@ -863,5 +992,130 @@ bool KDTree::validateKDTree(const float3 *d_pos) const
 
     printf("[KDTree validate] %s: %d nodes, %u levels, %d leaves (%d empty, %d above %d particles, largest %d), %d errors\n",
            errors == 0 ? "PASSED" : "FAILED", M, _num_levels, (int)leaves.size(), empty_leaves, big_leaves, leaf_threshold, max_leaf, errors);
+    return errors == 0;
+}
+
+// TEMPORARY, see the note above. Checks the preorder tree in _d_out_nodes by walking it from the root.
+bool KDTree::validatePreorderTree(const float3 *d_pos) const
+{
+    const int N = (int)num_particles;
+    const int M = (int)_num_nodes;
+    int errors = 0;
+    auto fail = [&errors](const char *fmt, auto... args)
+    {
+        if (errors++ < 10) // only print the first few
+        {
+            printf("[KDTree validate preorder] ");
+            printf(fmt, args...);
+            printf("\n");
+        }
+    };
+
+    if (N <= 0 || M <= 0)
+    {
+        fail("empty tree: %d nodes, %d particles", M, N);
+        return false;
+    }
+
+    std::vector<KDNode> nodes = copyToHost(_d_out_nodes.addr(), M);
+    std::vector<int> list_x = copyToHost(_list_x.addr(), N); // leaf particles are list_x[prim_start .. prim_start + count)
+    std::vector<float3> pos = copyToHost(d_pos, N);
+
+    std::vector<char> visited(M, 0);
+    std::vector<int> covered(N, 0); // how many leaves hold each list position
+    int leaves = 0, max_depth = 0;
+
+    auto component = [](const float3 &v, int axis)
+    { return axis == 0 ? v.x : (axis == 1 ? v.y : v.z); };
+    auto boxInside = [](const KDNode &inner, const KDNode &outer)
+    {
+        return inner.bb_min.x >= outer.bb_min.x && inner.bb_min.y >= outer.bb_min.y && inner.bb_min.z >= outer.bb_min.z &&
+               inner.bb_max.x <= outer.bb_max.x && inner.bb_max.y <= outer.bb_max.y && inner.bb_max.z <= outer.bb_max.z;
+    };
+
+    // Returns the number of nodes in the subtree at address, so the right child address can be checked
+    std::function<int(int, int)> visit = [&](int address, int depth) -> int
+    {
+        if (address < 0 || address >= M)
+        {
+            fail("address %d is outside the tree (%d nodes)", address, M);
+            return 0;
+        }
+        if (visited[address]++)
+        {
+            fail("node at address %d is reached twice", address);
+            return 0;
+        }
+        max_depth = std::max(max_depth, depth);
+        const KDNode &node = nodes[address];
+
+        if (node.isLeaf())
+        {
+            leaves++;
+            int start = node.prim_start, count = node.primCount();
+            if (start < 0 || count < 0 || start + count > N)
+            {
+                fail("leaf at address %d has an invalid particle range: start %d, count %d", address, start, count);
+                return 1;
+            }
+            for (int i = start; i < start + count; i++)
+            {
+                covered[i]++;
+                int id = list_x[i];
+                if (id < 0 || id >= N)
+                {
+                    fail("list_x[%d] holds invalid particle id %d", i, id);
+                    continue;
+                }
+                const float3 &q = pos[id];
+                if (q.x < node.bb_min.x || q.x > node.bb_max.x ||
+                    q.y < node.bb_min.y || q.y > node.bb_max.y ||
+                    q.z < node.bb_min.z || q.z > node.bb_max.z)
+                {
+                    fail("particle %d is outside the bounding box of the leaf at address %d", id, address);
+                }
+            }
+            return 1;
+        }
+
+        int left = address + 1; // the left child always follows its parent
+        int right = node.rightChild();
+        int axis = node.axis();
+        if (left >= M || right <= left || right >= M)
+        {
+            fail("node at address %d has invalid children: left %d, right %d (%d nodes)", address, left, right, M);
+            return 1;
+        }
+
+        const KDNode &l = nodes[left];
+        const KDNode &r = nodes[right];
+        if (!boxInside(l, node) || !boxInside(r, node))
+            fail("children of the node at address %d are not inside its bounding box", address);
+        if (component(l.bb_max, axis) != node.split_pos || component(r.bb_min, axis) != node.split_pos)
+            fail("children of the node at address %d do not meet at its split plane %g", address, node.split_pos);
+
+        int left_size = visit(left, depth + 1);
+        int right_size = visit(right, depth + 1);
+        if (right != address + 1 + left_size)
+            fail("node at address %d: right child at %d, expected %d (left subtree has %d nodes)", address, right, address + 1 + left_size, left_size);
+        return 1 + left_size + right_size;
+    };
+
+    int root_size = visit(0, 0);
+    if (root_size != M)
+        fail("root subtree has %d nodes, expected %d", root_size, M);
+    for (int a = 0; a < M; a++)
+    {
+        if (!visited[a])
+            fail("node at address %d is not reachable from the root", a);
+    }
+    for (int i = 0; i < N; i++)
+    {
+        if (covered[i] != 1)
+            fail("list position %d is held by %d leaves (expected 1)", i, covered[i]);
+    }
+
+    printf("[KDTree validate preorder] %s: %d nodes, %d leaves, depth %d, %d errors\n",
+           errors == 0 ? "PASSED" : "FAILED", M, leaves, max_depth, errors);
     return errors == 0;
 }

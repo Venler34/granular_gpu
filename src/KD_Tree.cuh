@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <vector_types.h>
 #include <memory>
+#include <vector>
 
 #include "DArray.hpp"
 #include "GranularParticles.hpp"
@@ -125,6 +126,104 @@ __global__ void updateParticleToNode(
     const int *__restrict__ _d_right_child,
     const int total_particles);
 
+// Preorder UPPASS for one tree level: computes how many KDNode slots the subtree of every node in the level takes
+__global__ void upPassLevel(
+    const int *__restrict__ left_child,
+    const int *__restrict__ right_child,
+    int *__restrict__ subtree_size,
+    const int level_start,
+    const int level_nodes);
+
+// =========================================================================
+// KD-Tree Node (final preorder tree)
+// =========================================================================
+
+// One node of the finished tree, stored in preorder: a node is followed by its whole left subtree, then its right
+// subtree, so the left child of the node at address a is always at a + 1. Exactly 32 bytes and 32 byte aligned,
+// which is the size of one GPU memory sector, so visiting a node costs one sector.
+//
+//   bytes  0..11   bb_min      bounding box of the node
+//   bytes 12..23   bb_max
+//   bytes 24..27   split_pos / prim_start   (union, which one is valid depends on the node type)
+//   bytes 28..31   link                     (bit packed, see below)
+//
+// Internal and leaf nodes need different data, so they share the last two words:
+//
+//   internal node:  split_pos  = position of the split plane
+//                   link       = right child address and split axis
+//   leaf node:      prim_start = index of the first particle, the particles are list[prim_start .. prim_start + prim_count)
+//                   link       = particle count and the leaf marker
+//
+// Bit packing of link: the lowest 2 bits are a tag, the upper 30 bits are a value.
+//
+//        bit 31                              bit 2   bit 1   bit 0
+//        [ value (right child or count) ...............  ] [ tag (2 bits) ]
+//
+//   tag 0, 1, 2 = internal node, the tag is the split axis (0 = x, 1 = y, 2 = z), value = right child address
+//   tag 3       = leaf node,                                                    value = particle count
+//
+//   encode:  link = (value << 2) | tag
+//   decode:  tag  = link & 3        value = link >> 2
+//
+//   Example internal node, right child at address 5, split along y:  link = (5 << 2) | 1 = 21 = 0b10101
+//       21 & 3 = 1 -> internal node, split axis y          21 >> 2 = 5 -> right child address
+//   Example leaf node holding 7 particles:                          link = (7 << 2) | 3 = 31 = 0b11111
+//       31 & 3 = 3 -> leaf                                 31 >> 2 = 7 -> particle count
+//
+// The value has 30 bits (kept non-negative so the shift is safe), so addresses and counts must stay below 2^29.
+struct alignas(32) KDNode
+{
+    float3 bb_min;
+    float3 bb_max;
+    union
+    {
+        float split_pos; // internal node
+        int prim_start;  // leaf node
+    };
+    int link; // tag in the lowest 2 bits, value in the rest, see above
+
+    static constexpr int TAG_MASK = 3;
+    static constexpr int LEAF_TAG = 3;
+
+    __host__ __device__ bool isLeaf() const { return (link & TAG_MASK) == LEAF_TAG; }
+    __host__ __device__ int axis() const { return link & TAG_MASK; }   // only valid for internal nodes
+    __host__ __device__ int rightChild() const { return link >> 2; }   // only valid for internal nodes
+    __host__ __device__ int primCount() const { return link >> 2; }    // only valid for leaf nodes
+
+    __host__ __device__ void setInternal(int split_axis, float split, int right_child)
+    {
+        split_pos = split;
+        link = (right_child << 2) | split_axis;
+    }
+    __host__ __device__ void setLeaf(int start, int count)
+    {
+        prim_start = start;
+        link = (count << 2) | LEAF_TAG;
+    }
+};
+static_assert(sizeof(KDNode) == 32, "KDNode must be exactly 32 bytes");
+
+// Preorder DOWNPASS for one tree level: gives the children of every node in the level their final address and
+// writes the node itself as a KDNode to its own address
+__global__ void downPassLevel(
+    const int *__restrict__ left_child,
+    const int *__restrict__ right_child,
+    const int *__restrict__ split_axis,
+    const float *__restrict__ split_pos,
+    const float *__restrict__ bbox_min_x,
+    const float *__restrict__ bbox_min_y,
+    const float *__restrict__ bbox_min_z,
+    const float *__restrict__ bbox_max_x,
+    const float *__restrict__ bbox_max_y,
+    const float *__restrict__ bbox_max_z,
+    const int *__restrict__ prim_head,
+    const int *__restrict__ prim_count,
+    const int *__restrict__ subtree_size,
+    int *__restrict__ preorder_address,
+    KDNode *__restrict__ out_nodes,
+    const int level_start,
+    const int level_nodes);
+
 // =========================================================================
 // KD-Tree Host Class
 // =========================================================================
@@ -145,10 +244,8 @@ public:
                                 _d_prim_head(size), _d_prim_count(size),
                                 // UPASS / DOWNPASS
                                 _d_subtree_size(0), _d_preorder_address(0),
-                                _d_start_levels(0), _d_size_levels(0),
                                 // Final preorder tree
-                                _d_out_split_axis(0), _d_out_split_position(0), _d_out_right_child(0),
-                                _d_out_bbox_minmax(0), _d_out_prim_start(0), _d_out_prim_count(0)
+                                _d_out_nodes(0)
     {
     }
     ~KDTree() = default;
@@ -158,6 +255,8 @@ public:
     // TEMPORARY debug check of the finished tree (slow, copies everything to the host), see KD_Tree.cu.
     // Remove together with its definition once the construction is validated.
     bool validateKDTree(const float3 *d_pos) const;
+    // TEMPORARY, same as above but checks the preorder tree in _d_out_nodes (call after constructKDTree)
+    bool validatePreorderTree(const float3 *d_pos) const;
 
     // Use an explicit root bounding box instead of the default (tight particle bounds + padding).
     void setRootBounds(float3 min_corner, float3 max_corner)
@@ -179,6 +278,9 @@ private:
 
     void constructKDTreeHelper(const float3 *d_pos, int num_particles);
     void scanAndScatter(DArray<int> &list_dim, DArray<int> &temp_dim);
+    void upPass();   // fills _d_subtree_size, bottom-up over the levels
+    void downPass(); // fills _d_preorder_address and _d_out_nodes, top-down over the levels
+    void buildPreorderTree(); // organizes the finished tree in preorder: upPass() then downPass()
 
     unsigned int num_particles;
 
@@ -197,7 +299,10 @@ private:
     // Node List (changes based on number of nodes in KD-Tree)
     unsigned int node_capacity;
     unsigned int _num_nodes = 0;  // number of nodes in the finished tree
-    unsigned int _num_levels = 0; // number of tree levels, _d_start_levels / _d_size_levels have this many entries
+    unsigned int _num_levels = 0; // number of tree levels, _level_start / _level_size have this many entries
+    // Per level info for the UPASS and DOWNPASS, which launch one kernel per level
+    std::vector<int> _level_start; // index of the first node of every level
+    std::vector<int> _level_size;  // number of nodes in every level
     DArray<int> _d_split_axis;
     DArray<float> _d_split_pos;
     DArray<int> _d_left_child; // index of left/right child of current node
@@ -218,17 +323,8 @@ private:
     DArray<int> _d_subtree_size;
     DArray<int> _d_preorder_address;
 
-    // Levels for UPASS and DOWNPASS Algorithm
-    DArray<int> _d_start_levels;
-    DArray<int> _d_size_levels;
-
-    // Once Tree is fully built, will store in preorder traversal
-    DArray<int> _d_out_split_axis;
-    DArray<int> _d_out_split_position;
-    DArray<int> _d_out_right_child;
-    DArray<int> _d_out_bbox_minmax;
-    DArray<int> _d_out_prim_start;
-    DArray<int> _d_out_prim_count;
+    // Once Tree is fully built, will store in preorder traversal, one KDNode per node (_num_nodes entries)
+    DArray<KDNode> _d_out_nodes;
 };
 
 #endif // KD_TREE_CUH
