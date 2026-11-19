@@ -138,6 +138,22 @@ void interactionSection(App &app) {
     app.explode();
   help("Pushes all particles away from their center of mass (key E).");
 
+  if (app.scene.system) {
+    Solver &solver = app.scene.system->get_solver();
+    bool use_kd = solver.get_use_kd_tree();
+    if (ImGui::Checkbox("KD-tree neighbors", &use_kd))
+      solver.set_use_kd_tree(use_kd);
+    help("Finds the granular contacts with a KD-tree instead of the grid. "
+         "Boundary particles still use the grid.");
+
+    static bool verify_kd = false;
+    if (use_kd)
+      ImGui::Checkbox("Check KD-tree (slow)", &verify_kd);
+    solver.set_kd_verify(verify_kd);
+    help("Compares the contacts found through the tree with brute force and "
+         "prints the result to the terminal every step.");
+  }
+
   if (app.config.scene == SceneType::Excavator && app.scene.has_obj) {
     ImGui::Checkbox("Animate bucket", &app.animate);
     help("Moves the bucket sideways, then tilts it by 45 degrees. Reset to "

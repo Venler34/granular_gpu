@@ -68,6 +68,7 @@ struct CompareAxisZ
 
 // Nodes at this level are forced to be leaves, so coincident particles (or boxes shrunk to float precision) can't split forever
 constexpr int MAX_TREE_DEPTH = 64;
+static_assert(MAX_TREE_DEPTH < KD_QUERY_STACK_SIZE, "the query stack in KD_Tree.cuh has to hold one entry per tree level");
 
 // Checks for kernel launch errors. Compile with -DKD_TREE_DEBUG_SYNC to also synchronize after every launch,
 // so errors raised while the kernel runs (e.g. out of bounds access) are reported at the kernel that caused them
@@ -91,6 +92,18 @@ static int readDeviceInt(const int *d_ptr, int index)
     int value;
     CUDA_CALL(cudaMemcpy(&value, d_ptr + index, sizeof(int), cudaMemcpyDeviceToHost));
     return value;
+}
+
+// Copies count elements from device memory into a new host vector
+template <typename T>
+static std::vector<T> copyToHost(const T *d_ptr, size_t count)
+{
+    std::vector<T> host(count);
+    if (count > 0)
+    {
+        CUDA_CALL(cudaMemcpy(host.data(), d_ptr, sizeof(T) * count, cudaMemcpyDeviceToHost));
+    }
+    return host;
 }
 
 // true if the empty space on one side of the node is more than 10% of the node's extent along that axis
@@ -745,11 +758,18 @@ void KDTree::buildPreorderTree()
 // particles is stored in device memory
 void KDTree::constructKDTree(const std::shared_ptr<GranularParticles> &particles)
 {
-    if (particles->size() <= 0)
+    constructKDTree(particles->get_pos_ptr(), particles->size());
+}
+
+// d_pos is stored in device memory
+void KDTree::constructKDTree(const float3 *d_pos, unsigned int count)
+{
+    if (count == 0)
     {
+        _num_nodes = 0; // nothing to query
         return;
     }
-    num_particles = particles->size(); // class member, used by the scans / kernels in the helper
+    num_particles = count; // class member, used by the scans / kernels in the helper
 
     if (num_particles > _list_x.capacity())
     {
@@ -763,8 +783,6 @@ void KDTree::constructKDTree(const std::shared_ptr<GranularParticles> &particles
         _is_left.resize(num_particles);
         _left_offset.resize(num_particles);
     }
-
-    const float3 *d_pos = particles->get_pos_ptr();
 
     // Fills with incrementing numbers representing particle ids
     thrust::sequence(thrust::device, _list_x.addr(), _list_x.addr() + num_particles);
@@ -796,6 +814,85 @@ void KDTree::constructKDTree(const std::shared_ptr<GranularParticles> &particles
     buildPreorderTree();
 }
 
+// Squared distance from a point to an axis aligned box, 0 if the point is inside the box
+static float distSqToBox(const float3 &p, const float3 &bb_min, const float3 &bb_max)
+{
+    float dx = fmaxf(fmaxf(bb_min.x - p.x, 0.0f), p.x - bb_max.x);
+    float dy = fmaxf(fmaxf(bb_min.y - p.y, 0.0f), p.y - bb_max.y);
+    float dz = fmaxf(fmaxf(bb_min.z - p.z, 0.0f), p.z - bb_max.z);
+    return dx * dx + dy * dy + dz * dz;
+}
+
+// Host side radius search on the preorder tree: returns the ids of all particles whose distance to center is
+// at most radius. The result is in traversal order (not sorted) and contains every particle at the center
+// position, including the one the center was taken from.
+// Everything the traversal reads (tree, particle order, positions) is copied to the host on every call, so this
+// is meant for checking the tree, not for querying many particles. d_pos has to be the positions the tree was built from.
+std::vector<int> KDTree::radiusSearch(const float3 *d_pos, float3 center, float radius) const
+{
+    std::vector<int> result;
+    if (_num_nodes == 0 || num_particles == 0 || radius < 0.0f)
+    {
+        return result;
+    }
+
+    std::vector<KDNode> nodes = copyToHost(_d_out_nodes.addr(), _num_nodes);
+    std::vector<int> list = copyToHost(_list_x.addr(), num_particles); // leaf particles are list[prim_start .. prim_start + count)
+    std::vector<float3> pos = copyToHost(d_pos, num_particles);
+
+    const float radius_sq = radius * radius;
+
+    // Depth first traversal with an explicit stack of node addresses, starting at the root (address 0)
+    std::vector<int> stack;
+    stack.push_back(0);
+    while (!stack.empty())
+    {
+        int address = stack.back();
+        stack.pop_back();
+        const KDNode &node = nodes[address];
+
+        // Nothing inside the node can be within the radius if the node's box is further away than that.
+        // For the far child of a split this also covers the split plane test: its box starts at the plane.
+        if (distSqToBox(center, node.bb_min, node.bb_max) > radius_sq)
+        {
+            continue;
+        }
+
+        if (node.isLeaf())
+        {
+            int start = node.prim_start;
+            for (int i = start; i < start + node.primCount(); i++)
+            {
+                int id = list[i];
+                float3 d = make_float3(pos[id].x - center.x, pos[id].y - center.y, pos[id].z - center.z);
+                if (d.x * d.x + d.y * d.y + d.z * d.z <= radius_sq)
+                {
+                    result.push_back(id);
+                }
+            }
+        }
+        else
+        {
+            stack.push_back(node.rightChild()); // right subtree
+            stack.push_back(address + 1);       // left child follows its parent, popped first
+        }
+    }
+    return result;
+}
+
+// Same as radiusSearch, with the center taken from the position of one particle
+std::vector<int> KDTree::radiusSearchParticle(const float3 *d_pos, int particle_id, float radius) const
+{
+    if (particle_id < 0 || particle_id >= (int)num_particles)
+    {
+        return std::vector<int>();
+    }
+
+    float3 center;
+    CUDA_CALL(cudaMemcpy(&center, d_pos + particle_id, sizeof(float3), cudaMemcpyDeviceToHost));
+    return radiusSearch(d_pos, center, radius);
+}
+
 // =====================================================================================================
 // TEMPORARY: debug validation of the finished tree. It copies everything to the host and checks the tree
 // with plain loops, so it is slow and only meant for development. Call validateKDTree(d_pos) (BFS tree built
@@ -803,17 +900,6 @@ void KDTree::constructKDTree(const std::shared_ptr<GranularParticles> &particles
 // constructKDTree while checking it. Once the tree is trusted, remove this whole section, the declarations
 // of validateKDTree and validatePreorderTree in KD_Tree.cuh, and every call to them.
 // =====================================================================================================
-template <typename T>
-static std::vector<T> copyToHost(const T *d_ptr, size_t count)
-{
-    std::vector<T> host(count);
-    if (count > 0)
-    {
-        CUDA_CALL(cudaMemcpy(host.data(), d_ptr, sizeof(T) * count, cudaMemcpyDeviceToHost));
-    }
-    return host;
-}
-
 bool KDTree::validateKDTree(const float3 *d_pos) const
 {
     const int N = (int)num_particles;

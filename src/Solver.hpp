@@ -1,5 +1,6 @@
 #pragma once
 #include "GranularParticles.hpp"
+#include "KD_Tree.cuh"
 #include <thrust/execution_policy.h>
 #include <thrust/reduce.h>
 #include <thrust/sort.h>
@@ -19,7 +20,7 @@ public:
         _buffer_merge(particles->size()),
         _buffer_merge_velocity(particles->size()),
         _buffer_merge_count(particles->size()),
-        _buffer_merge_lock(particles->size()) {
+        _buffer_merge_lock(particles->size()), _kd_tree(particles->size()) {
 
     thrust::device_ptr<int> thrust_remove =
         thrust::device_pointer_cast(_buffer_remove.addr());
@@ -90,6 +91,17 @@ public:
   float *get_buffer_merge_ptr() const { return _buffer_merge.addr(); }
   int *get_buffer_remove_ptr() const { return _buffer_remove.addr(); }
 
+  // Use a KD-tree instead of the uniform grid to find the granular neighbors in project(). The boundary
+  // particles still use the grid. The tree is built over the predicted positions at the start of every project().
+  void set_use_kd_tree(bool use) { _use_kd_tree = use; }
+  bool get_use_kd_tree() const { return _use_kd_tree; }
+  // Extra search radius for the tree query as a fraction of the largest particle radius. The tree is built once and
+  // the particles keep moving during the projection iterations, the margin covers that movement.
+  void set_kd_skin_factor(float factor) { _kd_skin_factor = factor; }
+  // Debug: after building the tree and again after the projection iterations, compare the contacts found through
+  // the tree with brute force for a sample of the particles and print the result. Slow, leave off normally.
+  void set_kd_verify(bool verify) { _kd_verify = verify; }
+
   void resize(const int size) {
     _buffer_merge_count.resize(size);
     _buffer_merge.resize(size);
@@ -107,6 +119,11 @@ public:
   }
 
 private:
+  // Debug check behind set_kd_verify, see there. pos and mass are the arrays the contacts are computed from.
+  void check_kd_neighbors(const KDTreeView &tree, const float3 *pos,
+                          const float *mass, int num, int density,
+                          float r_max, float skin, const char *when);
+
   const int _max_iter;
   const int _blend_factor;
   DArray<int> _buffer_int;
@@ -120,6 +137,10 @@ private:
   DArray<float3> _buffer_merge_velocity;
   DArray<int> _buffer_merge_count;
   DArray<int> _buffer_merge_lock;
+  KDTree _kd_tree;
+  bool _use_kd_tree = false;
+  bool _kd_verify = false;
+  float _kd_skin_factor = 1.0f;
   int _particles_merging;
   int _particles_splitting;
   std::vector<std::tuple<int, int, int>> _particle_stats;

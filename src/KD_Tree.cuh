@@ -203,6 +203,82 @@ struct alignas(32) KDNode
 };
 static_assert(sizeof(KDNode) == 32, "KDNode must be exactly 32 bytes");
 
+// =========================================================================
+// Device side radius query on the finished preorder tree
+// =========================================================================
+
+// Size of the traversal stack. The stack holds at most one pending right child per tree level, so it has to be larger
+// than MAX_TREE_DEPTH in KD_Tree.cu (checked there with a static_assert).
+constexpr int KD_QUERY_STACK_SIZE = 72;
+
+// Squared distance from a point to an axis aligned box, 0 if the point is inside the box
+__host__ __device__ inline float kdDistSqToBox(const float3 &p, const float3 &bb_min, const float3 &bb_max)
+{
+    const float dx = fmaxf(fmaxf(bb_min.x - p.x, 0.0f), p.x - bb_max.x);
+    const float dy = fmaxf(fmaxf(bb_min.y - p.y, 0.0f), p.y - bb_max.y);
+    const float dz = fmaxf(fmaxf(bb_min.z - p.z, 0.0f), p.z - bb_max.z);
+    return dx * dx + dy * dy + dz * dz;
+}
+
+// What a kernel needs to query the finished tree, a plain struct so it can be passed to kernels by value.
+//   nodes         the preorder tree, node 0 is the root
+//   particle_ids  the particle ids in leaf order, a leaf holds particle_ids[prim_start .. prim_start + count)
+struct KDTreeView
+{
+    const KDNode *nodes;
+    const int *particle_ids;
+    int num_nodes;
+};
+
+// Calls visit(particle_id) for every particle stored in a leaf whose bounding box is within radius of center.
+// This is a superset of the particles within the radius: the leaf boxes are the ones the tree was built from, the
+// particles themselves are not tested. The caller does that test, with the positions it wants (they may have moved
+// since the tree was built, see Solver::project). Every particle that was built into the tree at a position within
+// radius of center is guaranteed to be visited.
+// One thread runs one query, depth first with an explicit stack: the left child is the next node in memory, the right
+// child is pushed and visited after the whole left subtree.
+template <typename Visitor>
+__device__ inline void kdRadiusQuery(const KDTreeView &tree, const float3 center, const float radius, Visitor &&visit)
+{
+    if (tree.num_nodes == 0)
+    {
+        return;
+    }
+
+    const float radius_sq = radius * radius;
+    int stack[KD_QUERY_STACK_SIZE];
+    int top = 0;
+    int address = 0; // root
+
+    while (true)
+    {
+        const KDNode node = tree.nodes[address];
+
+        if (kdDistSqToBox(center, node.bb_min, node.bb_max) <= radius_sq)
+        {
+            if (!node.isLeaf())
+            {
+                stack[top++] = node.rightChild();
+                address = address + 1; // left child
+                continue;
+            }
+
+            const int start = node.prim_start;
+            const int count = node.primCount();
+            for (int k = 0; k < count; k++)
+            {
+                visit(tree.particle_ids[start + k]);
+            }
+        }
+
+        if (top == 0)
+        {
+            return;
+        }
+        address = stack[--top];
+    }
+}
+
 // Preorder DOWNPASS for one tree level: gives the children of every node in the level their final address and
 // writes the node itself as a KDNode to its own address
 __global__ void downPassLevel(
@@ -251,6 +327,17 @@ public:
     ~KDTree() = default;
 
     void constructKDTree(const std::shared_ptr<GranularParticles> &particles);
+    // Same, from any device array of positions (the particle id of a point is its index in the array)
+    void constructKDTree(const float3 *d_pos, unsigned int count);
+
+    // Handle for querying the finished tree on the device with kdRadiusQuery. Valid until the next constructKDTree.
+    KDTreeView view() const { return KDTreeView{_d_out_nodes.addr(), _list_x.addr(), (int)_num_nodes}; }
+
+    // Host side radius search on the finished preorder tree, returns the ids of all particles within radius of
+    // center (or of the given particle, including that particle itself). d_pos are the positions the tree was built from.
+    // Copies the tree to the host on every call, so it is slow and meant for checking the tree.
+    std::vector<int> radiusSearch(const float3 *d_pos, float3 center, float radius) const;
+    std::vector<int> radiusSearchParticle(const float3 *d_pos, int particle_id, float radius) const;
 
     // TEMPORARY debug check of the finished tree (slow, copies everything to the host), see KD_Tree.cu.
     // Remove together with its definition once the construction is validated.

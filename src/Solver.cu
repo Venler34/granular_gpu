@@ -358,6 +358,127 @@ __global__ void compute_delta_pos(float3 *delta_pos, int *n,
   return;
 }
 
+// Particles further apart than (r_i + r_max) times this factor can't touch. The small slack keeps particles that touch
+// exactly at the limit from being dropped by rounding in the squared distance test.
+#define KD_CONTACT_SLACK 1.0001f
+
+// Same as compute_delta_pos, but the granular neighbors come from the KD-tree instead of the grid. The boundary
+// particles still use the grid. The tree was built over the predicted positions at the start of project(), while
+// pos_granular holds the current ones, so the tree is searched with the margin kd_skin to cover the movement since then:
+//   a particle j touches i when |cur_i - cur_j| <= r_i + r_j <= r_i + r_max, and |cur_j - built_j| <= kd_skin,
+//   so the leaf holding j is within r_i + r_max + kd_skin of cur_i and is not skipped by the query.
+__global__ void compute_delta_pos_kd(
+    float3 *delta_pos, int *n, float3 *pos_granular, float3 *pos_boundary,
+    float *mass_granular, const int num, int *cell_start_boundary,
+    const int3 cell_size, const float cell_length, const int density,
+    float *scaled_mass, const KDTreeView tree, const float r_max,
+    const float kd_skin) {
+
+  const unsigned int i = __mul24(blockIdx.x, blockDim.x) + threadIdx.x;
+
+  // out of bounds
+  if (i >= num)
+    return;
+  float3 dp = make_float3(0.0f);
+
+  // Boundary particles: 27 neighboring cells of the grid, as in compute_delta_pos
+  for (auto m = 0; m < 27; ++m) {
+    const auto cellID = particlePos2cellIdx(
+        make_int3(pos_granular[i] / cell_length) +
+            make_int3(m / 9 - 1, (m % 9) / 3 - 1, m % 3 - 1),
+        cell_size);
+    if (cellID == (cell_size.x * cell_size.y * cell_size.z))
+      continue;
+
+    boundary_constraint(dp, n[i], i, pos_granular[i], pos_boundary,
+                        mass_granular, cell_start_boundary[cellID],
+                        cell_start_boundary[cellID + 1], density, scaled_mass);
+  }
+
+  // Granular particles: every particle in a leaf that the tree query reaches. The exact contact test is in
+  // particles_constraint, called with the one element range [j, j + 1)
+  const float3 pos_i = pos_granular[i];
+  const float r_i = cbrtf((3 * mass_granular[i]) / (4 * pi * density));
+  const float reach = (r_i + r_max) * KD_CONTACT_SLACK;
+  kdRadiusQuery(tree, pos_i, reach + kd_skin, [&](const int j) {
+    const float3 d = pos_i - pos_granular[j];
+    if (dot(d, d) > reach * reach)
+      return;
+    particles_constraint(dp, n[i], i, pos_granular, mass_granular, j, j + 1,
+                         density, n, delta_pos, scaled_mass);
+  });
+
+  delta_pos[i] = dp;
+  return;
+}
+
+// Debug check for the KD-tree neighbors. Every sampled particle i (every stride-th one) counts the particles that touch
+// it twice: by looping over all particles, and through the tree exactly like compute_delta_pos_kd does. The contact
+// test is the one of particles_constraint. counters = {particles where the counts differ, brute force total, tree total}
+__global__ void kd_verify_contacts(const float3 *pos, const float *mass,
+                                   const int num, const int stride,
+                                   const int density, const KDTreeView tree,
+                                   const float r_max, const float kd_skin,
+                                   int *counters) {
+  const int i = (__mul24(blockIdx.x, blockDim.x) + threadIdx.x) * stride;
+  if (i >= num)
+    return;
+
+  const float3 pos_i = pos[i];
+  const float r_i = cbrtf((3 * mass[i]) / (4 * pi * density));
+
+  int brute_force = 0;
+  for (int j = 0; j < num; j++) {
+    if (j == i)
+      continue;
+    const float r_j = cbrtf((3 * mass[j]) / (4 * pi * density));
+    const float dis = norm3df(pos_i.x - pos[j].x, pos_i.y - pos[j].y,
+                              pos_i.z - pos[j].z);
+    if ((r_i + r_j) - dis >= 0.0f)
+      brute_force++;
+  }
+
+  int through_tree = 0;
+  const float reach = (r_i + r_max) * KD_CONTACT_SLACK;
+  kdRadiusQuery(tree, pos_i, reach + kd_skin, [&](const int j) {
+    if (j == i)
+      return;
+    const float3 d = pos_i - pos[j];
+    if (dot(d, d) > reach * reach)
+      return;
+    const float r_j = cbrtf((3 * mass[j]) / (4 * pi * density));
+    const float dis = norm3df(pos_i.x - pos[j].x, pos_i.y - pos[j].y,
+                              pos_i.z - pos[j].z);
+    if ((r_i + r_j) - dis >= 0.0f)
+      through_tree++;
+  });
+
+  atomicAdd(&counters[1], brute_force);
+  atomicAdd(&counters[2], through_tree);
+  if (brute_force != through_tree)
+    atomicAdd(&counters[0], 1);
+}
+
+void Solver::check_kd_neighbors(const KDTreeView &tree, const float3 *pos,
+                                const float *mass, int num, int density,
+                                float r_max, float skin, const char *when) {
+  const int stride = std::max(1, num / 1024);
+  const int sampled = (num - 1) / stride + 1;
+
+  DArray<int> counters(3); // zero initialized
+  kd_verify_contacts<<<(sampled - 1) / block_size + 1, block_size>>>(
+      pos, mass, num, stride, density, tree, r_max, skin, counters.addr());
+  CHECK_KERNEL();
+  CUDA_CALL(cudaDeviceSynchronize());
+
+  int host[3];
+  CUDA_CALL(cudaMemcpy(host, counters.addr(), sizeof(host),
+                       cudaMemcpyDeviceToHost));
+  printf("KD-tree check (%s): %d of %d sampled particles differ, %d contacts "
+         "by brute force, %d through the tree\n",
+         when, host[0], sampled, host[1], host[2]);
+}
+
 struct change_position_functor {
 
   change_position_functor() {}
@@ -383,6 +504,47 @@ void Solver::project(std::shared_ptr<GranularParticles> &particles,
   const float3 zero = make_float3(0.0f, 0.0f, 0.0f);
   const int num = particles->size();
 
+  // KD-tree over the predicted positions, built once and used by every iteration below
+  KDTreeView kd_view{nullptr, nullptr, 0};
+  float kd_r_max = 0.0f;
+  float kd_skin = 0.0f;
+  if (_use_kd_tree) {
+    _kd_tree.constructKDTree(_pos_t.addr(), num);
+    kd_view = _kd_tree.view();
+
+    // Largest particle radius, the radius comes from the mass as in particles_constraint. The kernels take the
+    // density as an int, so use the same value here.
+    const float max_mass =
+        thrust::reduce(thrust::device, particles->get_mass_ptr(),
+                       particles->get_mass_ptr() + num, 0.0f,
+                       thrust::maximum<float>());
+    kd_r_max = cbrtf((3.0f * max_mass) /
+                     (4.0f * 3.14159265358979f * static_cast<int>(density)));
+    kd_skin = _kd_skin_factor * kd_r_max;
+
+    if (_kd_verify) {
+      check_kd_neighbors(kd_view, _pos_t.addr(), particles->get_mass_ptr(), num,
+                         density, kd_r_max, kd_skin, "after build");
+    }
+  }
+
+  // One evaluation of the position corrections, with the grid or with the tree
+  auto compute_corrections = [&]() {
+    if (_use_kd_tree) {
+      compute_delta_pos_kd<<<(num - 1) / block_size + 1, block_size>>>(
+          _buffer_float3.addr(), _num_constraints.addr(), _pos_t.addr(),
+          boundaries->get_pos_ptr(), particles->get_mass_ptr(), num,
+          cell_start_boundary.addr(), cell_size, cell_length, density,
+          particles->get_scaled_mass_ptr(), kd_view, kd_r_max, kd_skin);
+    } else {
+      compute_delta_pos<<<(num - 1) / block_size + 1, block_size>>>(
+          _buffer_float3.addr(), _num_constraints.addr(), _pos_t.addr(),
+          boundaries->get_pos_ptr(), particles->get_mass_ptr(), num,
+          cell_start_granular.addr(), cell_start_boundary.addr(), cell_size,
+          cell_length, density, particles->get_scaled_mass_ptr());
+    }
+  };
+
   while (stab_iter < 3) {
 
     // reset change in position and number of elements
@@ -396,12 +558,7 @@ void Solver::project(std::shared_ptr<GranularParticles> &particles,
     thrust::fill(thrust_num_constraints, thrust_num_constraints + num, 0);
 
     // calculate change in positon
-    compute_delta_pos<<<(num - 1) / block_size + 1, block_size>>>(
-
-        _buffer_float3.addr(), _num_constraints.addr(), _pos_t.addr(),
-        boundaries->get_pos_ptr(), particles->get_mass_ptr(), num,
-        cell_start_granular.addr(), cell_start_boundary.addr(), cell_size,
-        cell_length, density, particles->get_scaled_mass_ptr());
+    compute_corrections();
 
     // update the position
     auto begin_p = thrust::make_zip_iterator(
@@ -446,12 +603,7 @@ void Solver::project(std::shared_ptr<GranularParticles> &particles,
     thrust::fill(thrust_num_constraints, thrust_num_constraints + num, 0);
 
 
-    compute_delta_pos<<<(num - 1) / block_size + 1, block_size>>>(
-
-        _buffer_float3.addr(), _num_constraints.addr(), _pos_t.addr(),
-        boundaries->get_pos_ptr(), particles->get_mass_ptr(), num,
-        cell_start_granular.addr(), cell_start_boundary.addr(), cell_size,
-        cell_length, density, particles->get_scaled_mass_ptr());
+    compute_corrections();
     //
     auto begin = thrust::make_zip_iterator(thrust::make_tuple(
         _buffer_float3.addr(), _num_constraints.addr(), _pos_t.addr()));
@@ -466,6 +618,12 @@ void Solver::project(std::shared_ptr<GranularParticles> &particles,
         change_position_functor());
 
     iter++;
+  }
+
+  // The positions have moved since the tree was built, check that the margin was enough
+  if (_use_kd_tree && _kd_verify) {
+    check_kd_neighbors(kd_view, _pos_t.addr(), particles->get_mass_ptr(), num,
+                       density, kd_r_max, kd_skin, "after projection");
   }
 }
 
