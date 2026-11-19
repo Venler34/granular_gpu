@@ -99,7 +99,8 @@ public:
   // the particles keep moving during the projection iterations, the margin covers that movement.
   void set_kd_skin_factor(float factor) { _kd_skin_factor = factor; }
   // Debug: after building the tree and again after the projection iterations, compare the contacts found through
-  // the tree with brute force for a sample of the particles and print the result. Slow, leave off normally.
+  // the tree with brute force for a sample of the particles and print the result. Slow, so it only runs every
+  // KD_VERIFY_INTERVAL-th step on a limited sample, leave it off normally.
   void set_kd_verify(bool verify) { _kd_verify = verify; }
 
   void resize(const int size) {
@@ -140,6 +141,7 @@ private:
   KDTree _kd_tree;
   bool _use_kd_tree = false;
   bool _kd_verify = false;
+  int _kd_verify_step = 0; // counts project() calls, the check only runs on some of them
   float _kd_skin_factor = 1.0f;
   int _particles_merging;
   int _particles_splitting;

@@ -362,6 +362,12 @@ __global__ void compute_delta_pos(float3 *delta_pos, int *n,
 // exactly at the limit from being dropped by rounding in the squared distance test.
 #define KD_CONTACT_SLACK 1.0001f
 
+// The debug check only runs every this many steps, and tests few enough particles that the brute force part (sampled
+// particles times all particles) stays around KD_VERIFY_MAX_WORK distance tests, so the kernel can't run long enough
+// to trip the GPU watchdog.
+#define KD_VERIFY_INTERVAL 30
+#define KD_VERIFY_MAX_WORK 200000000LL
+
 // Same as compute_delta_pos, but the granular neighbors come from the KD-tree instead of the grid. The boundary
 // particles still use the grid. The tree was built over the predicted positions at the start of project(), while
 // pos_granular holds the current ones, so the tree is searched with the margin kd_skin to cover the movement since then:
@@ -462,7 +468,12 @@ __global__ void kd_verify_contacts(const float3 *pos, const float *mass,
 void Solver::check_kd_neighbors(const KDTreeView &tree, const float3 *pos,
                                 const float *mass, int num, int density,
                                 float r_max, float skin, const char *when) {
-  const int stride = std::max(1, num / 1024);
+  if (num <= 0)
+    return;
+
+  const int max_samples =
+      static_cast<int>(std::max(1LL, std::min(1024LL, KD_VERIFY_MAX_WORK / num)));
+  const int stride = std::max(1, num / max_samples);
   const int sampled = (num - 1) / stride + 1;
 
   DArray<int> counters(3); // zero initialized
@@ -505,6 +516,8 @@ void Solver::project(std::shared_ptr<GranularParticles> &particles,
   const int num = particles->size();
 
   // KD-tree over the predicted positions, built once and used by every iteration below
+  const bool kd_check =
+      _use_kd_tree && _kd_verify && (_kd_verify_step++ % KD_VERIFY_INTERVAL == 0);
   KDTreeView kd_view{nullptr, nullptr, 0};
   float kd_r_max = 0.0f;
   float kd_skin = 0.0f;
@@ -522,7 +535,7 @@ void Solver::project(std::shared_ptr<GranularParticles> &particles,
                      (4.0f * 3.14159265358979f * static_cast<int>(density)));
     kd_skin = _kd_skin_factor * kd_r_max;
 
-    if (_kd_verify) {
+    if (kd_check) {
       check_kd_neighbors(kd_view, _pos_t.addr(), particles->get_mass_ptr(), num,
                          density, kd_r_max, kd_skin, "after build");
     }
@@ -621,7 +634,7 @@ void Solver::project(std::shared_ptr<GranularParticles> &particles,
   }
 
   // The positions have moved since the tree was built, check that the margin was enough
-  if (_use_kd_tree && _kd_verify) {
+  if (kd_check) {
     check_kd_neighbors(kd_view, _pos_t.addr(), particles->get_mass_ptr(), num,
                        density, kd_r_max, kd_skin, "after projection");
   }
