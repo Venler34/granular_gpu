@@ -2,6 +2,7 @@
 #include "DArray.hpp"
 #include "GranularParticles.hpp"
 #include "GranularSystem.hpp"
+#include "Nvtx.hpp"
 #include "helper_math.h"
 #include <algorithm>
 #include <cuda_runtime.h>
@@ -69,6 +70,7 @@ GranularSystem::GranularSystem(
 void GranularSystem::neighbor_search_granular(
     const std::shared_ptr<GranularParticles> &particles,
     DArray<int> &cell_start) {
+  NVTX_RANGE("neighbor_search_granular");
   int num = particles->size();
 
   // Create and initialize indices array
@@ -177,6 +179,7 @@ void GranularSystem::neighbor_search_granular(
 void GranularSystem::neighbor_search_boundary(
     const std::shared_ptr<GranularParticles> &particles,
     DArray<int> &cell_start) {
+  NVTX_RANGE("neighbor_search_boundary");
   int num = particles->size();
   // std::cout << "Starting neighbor search for " << num << " particles"
   //           << std::endl;
@@ -276,6 +279,7 @@ void GranularSystem::neighbor_search_boundary(
 void GranularSystem::neighbor_search_upsampled(
     const std::shared_ptr<GranularParticles> &particles,
     DArray<int> &cell_start) {
+  NVTX_RANGE("neighbor_search_upsampled");
   int num = particles->size();
 
   // Verify memory state
@@ -389,6 +393,7 @@ void GranularSystem::neighbor_search_upsampled(
 }
 
 float GranularSystem::step() {
+  NVTX_RANGE("GranularSystem::step");
   cudaEvent_t start, stop;
   CUDA_CALL(cudaEventCreate(&start));
   CUDA_CALL(cudaEventCreate(&stop));

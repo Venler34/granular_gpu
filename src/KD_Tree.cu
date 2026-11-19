@@ -31,6 +31,7 @@
 #include "CUDAFunctions.cuh" // CUDA error checking macros (CUDA_CALL, CHECK_KERNEL) and block size
 #include "helper_math.h"     // Vector math operations (dot, length, normalize, float3 operators)
 #include "KD_Tree.cuh"
+#include "Nvtx.hpp"
 
 // Custom device comparators reading directly from float3* pos
 struct CompareAxisX
@@ -704,6 +705,7 @@ void KDTree::constructKDTreeHelper(const float3 *d_pos, int num_particles)
 // Runs the UPPASS over all levels, bottom-up. Launches on the same stream run in order, so no sync is needed between levels
 void KDTree::upPass()
 {
+  NVTX_RANGE("KDTree::upPass");
     const int blockSize = 256;
     for (int level = (int)_num_levels - 1; level >= 0; level--)
     {

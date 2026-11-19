@@ -2,6 +2,7 @@
 #include "Global.hpp"
 #include "GranularParticles.hpp"
 #include "Solver.hpp"
+#include "Nvtx.hpp"
 #include "helper_math.h"
 #include <algorithm>
 #include <cstdio>
@@ -43,6 +44,7 @@ void Solver::step(std::shared_ptr<GranularParticles> &particles,
                   const DArray<int> &cell_start_boundary, float3 space_size,
                   int3 cell_size, float cell_length, float dt, float3 G,
                   const float density) {
+  NVTX_RANGE("Solver::step");
 
   _buffer_int.resize(particles->size());
   // apply forces
@@ -82,6 +84,7 @@ void Solver::update_neighborhood(
 
 void Solver::add_external_force(std::shared_ptr<GranularParticles> &particles,
                                 float dt, float3 G) {
+  NVTX_RANGE("add_external_force");
   const auto dv = dt * G;
   thrust::transform(thrust::device, particles->get_vel_ptr(),
                     particles->get_vel_ptr() + particles->size(),
@@ -104,6 +107,7 @@ struct predict_position_functor {
 
 void Solver::update_particle_positions(
     std::shared_ptr<GranularParticles> &particles, float dt) {
+  NVTX_RANGE("update_particle_positions");
   auto begin = thrust::make_zip_iterator(
       thrust::make_tuple(particles->get_pos_ptr(), particles->get_vel_ptr()));
   auto end = thrust::make_zip_iterator(
@@ -138,6 +142,7 @@ struct mass_scaling_functor {
 };
 
 void Solver::apply_mass_scaling(std::shared_ptr<GranularParticles> &particles) {
+  NVTX_RANGE("apply_mass_scaling");
   auto begin = thrust::make_zip_iterator(
       thrust::make_tuple(particles->get_mass_ptr(), particles->get_pos_ptr()));
   auto end = thrust::make_zip_iterator(
@@ -509,6 +514,7 @@ void Solver::project(std::shared_ptr<GranularParticles> &particles,
                      const DArray<int> &cell_start_boundary, int3 cell_size,
                      float3 space_size, float cell_length, int max_iter,
                      const float density) {
+  NVTX_RANGE("Solver::project");
 
   int iter = 0;
   int stab_iter = 0;
@@ -522,6 +528,7 @@ void Solver::project(std::shared_ptr<GranularParticles> &particles,
   float kd_r_max = 0.0f;
   float kd_skin = 0.0f;
   if (_use_kd_tree) {
+    NVTX_RANGE("KD tree build + view");
     _kd_tree.constructKDTree(_pos_t.addr(), num);
     kd_view = _kd_tree.view();
 
@@ -559,6 +566,7 @@ void Solver::project(std::shared_ptr<GranularParticles> &particles,
   };
 
   while (stab_iter < 3) {
+    NVTX_RANGE("stabilization iteration");
 
     // reset change in position and number of elements
     thrust::device_ptr<float3> thrust_buffer_float_3 =
@@ -604,6 +612,7 @@ void Solver::project(std::shared_ptr<GranularParticles> &particles,
   }
 
   while (iter < max_iter) {
+    NVTX_RANGE("projection iteration");
 
     // reset delta p and num constraints
     thrust::device_ptr<float3> thrust_buffer_float_3 =
@@ -987,6 +996,7 @@ void Solver::adaptive_sampling(
     const DArray<int> &cell_start_granular,
     const DArray<int> &cell_start_boundary, const float max_mass,
     int3 cell_size, float3 space_size, float cell_length, const float density) {
+  NVTX_RANGE("adaptive_sampling");
   const int num = particles->size();
   if (num == 0) {
     return;

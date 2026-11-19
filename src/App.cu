@@ -1,3 +1,4 @@
+#include "Nvtx.hpp"
 #include "App.hpp"
 #include "Export.hpp"
 #include "Ui.hpp"
@@ -84,6 +85,7 @@ void App::reset() {
 }
 
 void App::step() {
+  NVTX_RANGE("App::step");
   if (animate) {
     updateAnimation(scene.animation, *scene.system->get_boundaries(),
                     config.dt);
